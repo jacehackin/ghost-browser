@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ghost — CORS-Free Browser-in-a-Userscript
+// @name         Ghost Browser (full)
 // @namespace    ghost.mahi
-// @version      1.0.0
-// @description  Full CORS bypass, CSP strip, frame-buster neutralizer, live request log, header+body rewriting, HAR export. All in one userscript.
+// @version      2.0.0
+// @description  Fullscreen CORS-free browser as a userscript. Tabs, omnibox, instant search, proxy-rendered pages, HAR export.
 // @author       Mahi
 // @match        *://*/*
 // @run-at       document-start
@@ -20,373 +20,70 @@
 (function () {
   'use strict';
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 0. GM BRIDGE
-  // ═══════════════════════════════════════════════════════════════════
-  const gm = {
-    xhr:  (o) => GM_xmlhttpRequest(o),
-    get:  (k, d) => GM_getValue(k, d),
-    set:  (k, v) => GM_setValue(k, v),
-    del:  (k) => GM_deleteValue(k),
-    list: () => GM_listValues(),
-    menu: (label, fn) => GM_registerMenuCommand(label, fn),
-    notify: (text, title) => { try { GM_notification({ text, title: title || 'Ghost' }); } catch (e) {} }
-  };
+  // ══════════════════════════════════════════════════════════════════════════
+  // 0. SAFETY + TOP-WINDOW BRIDGE
+  // ══════════════════════════════════════════════════════════════════════════
+  const TOP = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  // Only one instance per page
+  if (TOP.__ghostBrowserInstalled) return;
+  TOP.__ghostBrowserInstalled = true;
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 1. CONSTANTS
-  // ═══════════════════════════════════════════════════════════════════
-  const LS_SETTINGS = 'ghost:settings';
-  const LS_RULES    = 'ghost:rules:header';
-  const LS_BODY     = 'ghost:rules:body';
-  const MAX_LOG     = 1500;
-  const MAX_BODY    = 512 * 1024;
+  // ══════════════════════════════════════════════════════════════════════════
+  // 1. GM BRIDGE (with localStorage fallback)
+  // ══════════════════════════════════════════════════════════════════════════
+  const hasGM = typeof GM_setValue === 'function';
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 2. SETTINGS
-  // ═══════════════════════════════════════════════════════════════════
-  const DEFAULT_SETTINGS = {
-    cspStrip: true,
-    frameBuster: true,
-    patchFetch: true,
-    patchXHR: true,
-    verbose: false,
-    hudVisible: false
-  };
-
-  const settings = Object.assign({}, DEFAULT_SETTINGS, gm.get(LS_SETTINGS, {}));
-
-  function saveSettings() {
-    gm.set(LS_SETTINGS, settings);
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // 3. RULE ENGINE — HEADER RULES
-  // ═══════════════════════════════════════════════════════════════════
-  const DEFAULT_HEADER_RULES = [
-    {
-      id: 'strip-csp',
-      enabled: true,
-      match: '.*',
-      phase: 'response',
-      set: {},
-      remove: [
-        'Content-Security-Policy',
-        'Content-Security-Policy-Report-Only',
-        'X-WebKit-CSP',
-        'X-Content-Security-Policy'
-      ]
+  const store = {
+    get(k, d) {
+      if (hasGM) { try { return GM_getValue(k, d); } catch (e) { return d; } }
+      try { const v = localStorage.getItem('ghost:' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; }
     },
-    {
-      id: 'permissive-cors',
-      enabled: true,
-      match: '.*',
-      phase: 'response',
-      set: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
-        'Access-Control-Allow-Headers': '*',
-        'Access-Control-Expose-Headers': '*',
-        'Access-Control-Max-Age': '86400'
-      },
-      remove: [
-        'Cross-Origin-Opener-Policy',
-        'Cross-Origin-Embedder-Policy',
-        'Cross-Origin-Resource-Policy',
-        'X-Frame-Options',
-        'Strict-Transport-Security'
-      ]
+    set(k, v) {
+      if (hasGM) { try { GM_setValue(k, v); return; } catch (e) {} }
+      try { localStorage.setItem('ghost:' + k, JSON.stringify(v)); } catch (e) {}
+    },
+    del(k) {
+      if (hasGM) { try { GM_deleteValue(k); return; } catch (e) {} }
+      try { localStorage.removeItem('ghost:' + k); } catch (e) {}
+    },
+    keys() {
+      if (hasGM) { try { return GM_listValues(); } catch (e) { return []; } }
+      return Object.keys(localStorage).filter((k) => k.startsWith('ghost:')).map((k) => k.slice(6));
     }
-  ];
+  };
 
-  let headerRules = gm.get(LS_RULES, null);
-  if (!Array.isArray(headerRules) || !headerRules.length) {
-    headerRules = DEFAULT_HEADER_RULES.map((r) => Object.assign({}, r));
-    gm.set(LS_RULES, headerRules);
-  }
-
-  let compiledHeaderRe = new Map();
-
-  function compileHeaderRules() {
-    compiledHeaderRe.clear();
-    for (const r of headerRules) {
-      let re;
-      try {
-        re = new RegExp(r.match === '*' ? '.*' : (r.match || '.*'));
-      } catch (e) {
-        re = /$^/;
-      }
-      compiledHeaderRe.set(r.id, re);
-    }
-  }
-  compileHeaderRules();
-
-  function headerMatch(id, url) {
-    const re = compiledHeaderRe.get(id);
-    return re ? re.test(url) : false;
-  }
-
-  function applyRequestRules(url, headers) {
-    const out = Object.assign({}, headers || {});
-    const applied = [];
-    for (const r of headerRules) {
-      if (!r.enabled) continue;
-      if (r.phase !== 'request' && r.phase !== 'both') continue;
-      if (!headerMatch(r.id, url)) continue;
-
-      if (Array.isArray(r.remove) && r.remove.length) {
-        const kill = new Set(r.remove.map((h) => h.toLowerCase()));
-        for (const k of Object.keys(out)) {
-          if (kill.has(k.toLowerCase())) delete out[k];
-        }
-      }
-      if (r.set && typeof r.set === 'object') {
-        for (const [k, v] of Object.entries(r.set)) out[k] = v;
-      }
-      applied.push(r.id);
-    }
-    return { headers: out, applied };
-  }
-
-  function applyResponseRules(url, headers) {
-    const out = Object.assign({}, headers || {});
-    const applied = [];
-    for (const r of headerRules) {
-      if (!r.enabled) continue;
-      if (r.phase !== 'response' && r.phase !== 'both') continue;
-      if (!headerMatch(r.id, url)) continue;
-
-      if (Array.isArray(r.remove) && r.remove.length) {
-        const kill = new Set(r.remove.map((h) => h.toLowerCase()));
-        for (const k of Object.keys(out)) {
-          if (kill.has(k.toLowerCase())) delete out[k];
-        }
-      }
-      if (r.set && typeof r.set === 'object') {
-        for (const [k, v] of Object.entries(r.set)) out[k] = v;
-      }
-      applied.push(r.id);
-    }
-    return { headers: out, applied };
-  }
-
-  function persistHeaderRules() {
-    gm.set(LS_RULES, headerRules);
-    compileHeaderRules();
-  }
-
-  function addHeaderRule(rule) {
-    rule.id = rule.id || ('hr-' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
-    rule.enabled = rule.enabled !== false;
-    rule.phase = rule.phase || 'both';
-    rule.match = rule.match || '.*';
-    rule.set = rule.set || {};
-    rule.remove = rule.remove || [];
-    headerRules.push(rule);
-    persistHeaderRules();
-    return rule;
-  }
-
-  function updateHeaderRule(id, patch) {
-    const i = headerRules.findIndex((r) => r.id === id);
-    if (i === -1) return null;
-    headerRules[i] = Object.assign({}, headerRules[i], patch);
-    persistHeaderRules();
-    return headerRules[i];
-  }
-
-  function removeHeaderRule(id) {
-    const before = headerRules.length;
-    headerRules = headerRules.filter((r) => r.id !== id);
-    persistHeaderRules();
-    return headerRules.length !== before;
-  }
-
-  function resetHeaderRules() {
-    headerRules = DEFAULT_HEADER_RULES.map((r) => Object.assign({}, r));
-    persistHeaderRules();
-    return headerRules;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // 4. RULE ENGINE — BODY RULES
-  // ═══════════════════════════════════════════════════════════════════
-  const DEFAULT_BODY_RULES = [
-    {
-      id: 'unwrap-envelope',
-      enabled: false,
-      match: '.*/api/.*',
-      contentType: 'application/json',
-      mode: 'json',
-      order: 100,
-      transform: 'if (data && typeof data === "object" && "data" in data && Object.keys(data).length === 1) return data.data; return data;'
-    }
-  ];
-
-  let bodyRules = gm.get(LS_BODY, null);
-  if (!Array.isArray(bodyRules) || !bodyRules.length) {
-    bodyRules = DEFAULT_BODY_RULES.map((r) => Object.assign({}, r));
-    gm.set(LS_BODY, bodyRules);
-  }
-
-  let compiledBodyRules = [];
-
-  function compileBodyRules() {
-    compiledBodyRules = [];
-    const sorted = bodyRules.slice().filter((r) => r.enabled).sort((a, b) => (a.order || 0) - (b.order || 0));
-    for (const r of sorted) {
-      let urlRe, ctRe, fn = null;
-      try { urlRe = new RegExp(r.match || '.*'); } catch (e) { urlRe = /$^/; }
-      try { ctRe = new RegExp(r.contentType || '.*'); } catch (e) { ctRe = /.*/; }
-      if (r.transform) {
-        try {
-          fn = new Function('data', '"use strict";\n' + r.transform + '\n');
-        } catch (e) { fn = null; }
-      }
-      compiledBodyRules.push({ rule: r, urlRe, ctRe, fn });
-    }
-  }
-  compileBodyRules();
-
-  function persistBodyRules() {
-    gm.set(LS_BODY, bodyRules);
-    compileBodyRules();
-  }
-
-  function addBodyRule(rule) {
-    rule.id = rule.id || ('br-' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));
-    rule.enabled = rule.enabled !== false;
-    rule.mode = rule.mode || 'json';
-    rule.match = rule.match || '.*';
-    rule.contentType = rule.contentType || 'application/json';
-    rule.order = rule.order || 100;
-    rule.transform = rule.transform || 'return data;';
-    bodyRules.push(rule);
-    persistBodyRules();
-    return rule;
-  }
-
-  function updateBodyRule(id, patch) {
-    const i = bodyRules.findIndex((r) => r.id === id);
-    if (i === -1) return null;
-    bodyRules[i] = Object.assign({}, bodyRules[i], patch);
-    persistBodyRules();
-    return bodyRules[i];
-  }
-
-  function removeBodyRule(id) {
-    const before = bodyRules.length;
-    bodyRules = bodyRules.filter((r) => r.id !== id);
-    persistBodyRules();
-    return bodyRules.length !== before;
-  }
-
-  function resetBodyRules() {
-    bodyRules = DEFAULT_BODY_RULES.map((r) => Object.assign({}, r));
-    persistBodyRules();
-    return bodyRules;
-  }
-
-  async function applyBodyRules(url, contentType, buffer) {
-    if (!compiledBodyRules.length) return { buffer, changed: false, applied: [] };
-
-    let text = null;
+  const gmFetch = (opts) => new Promise((resolve, reject) => {
+    if (typeof GM_xmlhttpRequest !== 'function') return reject(new Error('GM_xmlhttpRequest unavailable'));
+    let reqObj;
     try {
-      text = new TextDecoder('utf-8').decode(new Uint8Array(buffer));
-    } catch (e) {
-      return { buffer, changed: false, applied: [] };
-    }
+      reqObj = GM_xmlhttpRequest({
+        method: opts.method || 'GET',
+        url: opts.url,
+        headers: opts.headers || {},
+        data: opts.body,
+        responseType: opts.responseType || 'arraybuffer',
+        timeout: opts.timeout || 60000,
+        withCredentials: opts.withCredentials !== false,
+        onload: (r) => resolve({
+          status: r.status || 0,
+          statusText: r.statusText || '',
+          headers: parseGMHeaders(r.responseHeaders),
+          response: r.response,
+          finalUrl: r.finalUrl || opts.url
+        }),
+        onerror: (r) => reject(new Error('GM network error: ' + (r && r.error || 'unknown'))),
+        ontimeout: () => reject(new Error('GM timeout')),
+        onabort: () => reject(new Error('GM aborted'))
+      });
+    } catch (e) { reject(e); }
+    return reqObj;
+  });
 
-    let anyChanged = false;
-    const appliedIds = [];
-
-    for (const { rule, urlRe, ctRe, fn } of compiledBodyRules) {
-      if (!fn) continue;
-      if (!urlRe.test(url)) continue;
-      if (!ctRe.test(contentType || '')) continue;
-
-      try {
-        if (rule.mode === 'json') {
-          const parsed = JSON.parse(text);
-          const out = fn(parsed);
-          const next = JSON.stringify(out);
-          if (next !== text) { text = next; anyChanged = true; }
-        } else {
-          const out = fn(text);
-          if (typeof out === 'string' && out !== text) { text = out; anyChanged = true; }
-        }
-        appliedIds.push(rule.id);
-      } catch (e) {
-        // skip malformed rule; others continue
-      }
-    }
-
-    if (!anyChanged) return { buffer, changed: false, applied: appliedIds };
-
-    const encoded = new TextEncoder().encode(text).buffer;
-    return { buffer: encoded, changed: true, applied: appliedIds };
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // 5. LOG STORE
-  // ═══════════════════════════════════════════════════════════════════
-  const logStore = (() => {
-    const ring = [];
-    const listeners = new Set();
-    let seq = 0;
-
-    function push(entry) {
-      seq += 1;
-      const rec = {
-        id: seq,
-        ts: Date.now(),
-        method: (entry.method || 'GET').toUpperCase(),
-        url: entry.url || '',
-        status: entry.status || 0,
-        statusText: entry.statusText || '',
-        bytes: entry.bytes || 0,
-        duration: entry.duration || 0,
-        crossOrigin: !!entry.crossOrigin,
-        blocked: !!entry.blocked,
-        contentType: entry.contentType || '',
-        reqHeaders: entry.reqHeaders || null,
-        resHeaders: entry.resHeaders || null
-      };
-      ring.push(rec);
-      if (ring.length > MAX_LOG) ring.shift();
-      for (const fn of listeners) {
-        try { fn(rec); } catch (e) {}
-      }
-      return rec;
-    }
-
-    function all() { return ring.slice(); }
-
-    function clear() {
-      ring.length = 0;
-      for (const fn of listeners) {
-        try { fn({ id: 0, __clear: true, ts: Date.now() }); } catch (e) {}
-      }
-    }
-
-    function subscribe(fn) {
-      listeners.add(fn);
-      return () => listeners.delete(fn);
-    }
-
-    return { push, all, clear, subscribe };
-  })();
-
-  // ═══════════════════════════════════════════════════════════════════
-  // 6. HELPERS
-  // ═══════════════════════════════════════════════════════════════════
   function parseGMHeaders(raw) {
     const out = {};
     if (!raw) return out;
-    const lines = String(raw).split(/\r?\n/);
-    for (const line of lines) {
+    for (const line of String(raw).split(/\r?\n/)) {
       if (!line) continue;
       const i = line.indexOf(':');
       if (i === -1) continue;
@@ -398,643 +95,613 @@
     return out;
   }
 
-  function isCrossOrigin(url) {
-    try {
-      const u = new URL(url, location.href);
-      if (!/^https?:$/.test(u.protocol)) return false;
-      return u.origin !== location.origin;
-    } catch (e) {
-      return false;
-    }
+  // ══════════════════════════════════════════════════════════════════════════
+  // 2. SETTINGS
+  // ══════════════════════════════════════════════════════════════════════════
+  const SETTINGS_KEY = 'settings';
+  const SETTINGS_DEFAULTS = {
+    engine: 'duckduckgo',
+    autoOpenOnBlank: true,
+    showLauncher: true,
+    stripIntegrity: true,
+    blockPopups: true
+  };
+
+  let settings = Object.assign({}, SETTINGS_DEFAULTS, store.get(SETTINGS_KEY, {}));
+  function saveSettings() { store.set(SETTINGS_KEY, settings); }
+
+  const ENGINES = {
+    duckduckgo: (q) => 'https://duckduckgo.com/?q=' + encodeURIComponent(q),
+    google:     (q) => 'https://www.google.com/search?q=' + encodeURIComponent(q),
+    bing:       (q) => 'https://www.bing.com/search?q=' + encodeURIComponent(q),
+    brave:      (q) => 'https://search.brave.com/search?q=' + encodeURIComponent(q),
+    startpage:  (q) => 'https://www.startpage.com/sp/search?query=' + encodeURIComponent(q)
+  };
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 3. HISTORY
+  // ══════════════════════════════════════════════════════════════════════════
+  const HISTORY_KEY = 'history';
+  const HISTORY_MAX = 2000;
+
+  let historyCache = null;
+
+  function historyLoad() {
+    if (historyCache) return historyCache;
+    const arr = store.get(HISTORY_KEY, []);
+    historyCache = Array.isArray(arr) ? arr : [];
+    return historyCache;
   }
 
-  function headersToObject(h) {
-    const out = {};
-    if (!h) return out;
-    try {
-      if (typeof Headers !== 'undefined' && h instanceof Headers) {
-        h.forEach((v, k) => { out[k] = v; });
-      } else if (Array.isArray(h)) {
-        for (const pair of h) {
-          if (pair && pair.length >= 2) out[pair[0]] = pair[1];
-        }
-      } else if (typeof h === 'object') {
-        for (const [k, v] of Object.entries(h)) out[k] = v;
-      }
-    } catch (e) {}
+  function historyFlush() {
+    if (!historyCache) return;
+    if (historyCache.length > HISTORY_MAX) historyCache.splice(0, historyCache.length - HISTORY_MAX);
+    store.set(HISTORY_KEY, historyCache);
+  }
+
+  function historyAdd(url, title) {
+    if (!url) return;
+    if (/^(ghost|about|chrome|devtools|data|blob|javascript):/i.test(url)) return;
+    const norm = normalizeUrl(url);
+    const list = historyLoad();
+    const last = list[list.length - 1];
+    if (last && last.url === norm) {
+      last.ts = Date.now();
+      last.visits = (last.visits || 1) + 1;
+      if (title) last.title = String(title).slice(0, 256);
+      historyFlush();
+      return;
+    }
+    list.push({ url: norm, title: String(title || '').slice(0, 256), ts: Date.now(), visits: 1 });
+    historyFlush();
+  }
+
+  function historyAll() { return historyLoad().slice(); }
+  function historyRecent(n) { return historyLoad().slice(-n).reverse(); }
+  function historyClear() { historyCache = []; historyFlush(); }
+  function historyRemove(url) {
+    const norm = normalizeUrl(url);
+    historyCache = historyLoad().filter((e) => e.url !== norm);
+    historyFlush();
+  }
+
+  function normalizeUrl(u) {
+    if (!u) return '';
+    try { const x = new URL(u); x.hash = ''; return x.href; } catch (e) { return String(u); }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 4. BOOKMARKS
+  // ══════════════════════════════════════════════════════════════════════════
+  const BOOKMARK_KEY = 'bookmarks';
+  let bookmarkCache = null;
+
+  function bmLoad() {
+    if (bookmarkCache) return bookmarkCache;
+    const arr = store.get(BOOKMARK_KEY, []);
+    bookmarkCache = Array.isArray(arr) ? arr : [];
+    return bookmarkCache;
+  }
+  function bmFlush() { store.set(BOOKMARK_KEY, bmLoad()); }
+  function bmAll() { return bmLoad().slice(); }
+  function bmHas(url) {
+    const n = normalizeUrl(url);
+    return bmLoad().some((b) => b.url === n);
+  }
+  function bmAdd(url, title) {
+    const n = normalizeUrl(url);
+    if (!n) return null;
+    const arr = bmLoad();
+    const existing = arr.find((b) => b.url === n);
+    if (existing) {
+      if (title) existing.title = String(title).slice(0, 256);
+      bmFlush();
+      return existing;
+    }
+    const entry = { url: n, title: String(title || n).slice(0, 256), ts: Date.now() };
+    arr.unshift(entry);
+    bmFlush();
+    return entry;
+  }
+  function bmRemove(url) {
+    const n = normalizeUrl(url);
+    bookmarkCache = bmLoad().filter((b) => b.url !== n);
+    bmFlush();
+  }
+  function bmToggle(url, title) {
+    if (bmHas(url)) { bmRemove(url); return false; }
+    bmAdd(url, title); return true;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 5. SEARCH INDEX
+  // ══════════════════════════════════════════════════════════════════════════
+  let searchIndex = null;
+
+  function buildIndex() {
+    const h = historyAll();
+    const b = bmAll();
+    const seen = new Set();
+    const out = [];
+    for (const e of b) {
+      if (!e.url || seen.has(e.url)) continue;
+      seen.add(e.url);
+      out.push({ url: e.url, title: e.title, ts: e.ts, bookmark: true, visits: 0 });
+    }
+    for (const e of h) {
+      if (!e.url || seen.has(e.url)) continue;
+      seen.add(e.url);
+      out.push({ url: e.url, title: e.title, ts: e.ts, bookmark: false, visits: e.visits || 1 });
+    }
+    searchIndex = out;
     return out;
   }
 
-  async function bodyToGM(body) {
-    if (body == null) return undefined;
-    if (typeof body === 'string') return body;
-    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();
-    if (typeof FormData !== 'undefined' && body instanceof FormData) return body;
-    if (typeof Blob !== 'undefined' && body instanceof Blob) return body;
-    if (body instanceof ArrayBuffer) return body;
-    if (ArrayBuffer.isView(body)) return body.buffer;
-    if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
-      try {
-        const reader = body.getReader();
-        const chunks = [];
-        let total = 0;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          total += value.length;
-          if (total > MAX_BODY) break;
-        }
-        const merged = new Uint8Array(total);
-        let off = 0;
-        for (const c of chunks) { merged.set(c, off); off += c.length; }
-        return merged.buffer;
-      } catch (e) {
-        return undefined;
-      }
-    }
-    try { return String(body); } catch (e) { return undefined; }
+  function invalidateIndex() { searchIndex = null; }
+
+  function looksLikeUrl(q) {
+    if (!q || /\s/.test(q)) return false;
+    if (/^(https?|ftp|file):\/\//i.test(q)) return true;
+    if (/^localhost(:\d+)?(\/.*)?$/i.test(q)) return true;
+    if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?(\/.*)?$/.test(q)) return true;
+    if (/^[\w-]+(\.[\w-]+){1,}(:\d+)?(\/.*)?$/.test(q)) return true;
+    return false;
   }
 
-  function makeResponse(status, statusText, headers, buffer) {
-    const noBody = status === 204 || status === 205 || status === 304;
-    const h = new Headers();
-    for (const [k, v] of Object.entries(headers || {})) {
-      try { h.set(k, String(v)); } catch (e) {}
-    }
-    if (noBody) {
-      return new Response(null, { status, statusText, headers: h });
-    }
-    return new Response(buffer, { status, statusText, headers: h });
+  function toUrl(q) {
+    if (/^(https?|ftp|file):\/\//i.test(q)) return q;
+    if (/^localhost/i.test(q)) return 'http://' + q;
+    return 'https://' + q;
   }
 
-  function shortUrl(u) {
+  function scoreEntry(query, e) {
+    const q = query.toLowerCase();
+    const url = (e.url || '').toLowerCase();
+    const title = (e.title || '').toLowerCase();
+    let host = '';
+    try { host = new URL(e.url).hostname.replace(/^www\./, '').toLowerCase(); } catch (err) {}
+    let s = Infinity;
+
+    if (host === q) s = 0;
+    else if (host.startsWith(q)) s = 10 + (host.length - q.length);
+    else if (host.includes(q)) s = 40 + host.indexOf(q);
+    else if (url.startsWith(q)) s = 70;
+    else if (url.includes(q)) s = 100 + Math.min(60, url.indexOf(q));
+    else if (title.startsWith(q)) s = 140;
+    else if (title.includes(q)) s = 200 + Math.min(80, title.indexOf(q));
+    else {
+      let i = 0;
+      const hay = url + ' ' + title;
+      for (const c of hay) { if (c === q[i]) i += 1; if (i === q.length) break; }
+      s = (i === q.length) ? 400 : Infinity;
+    }
+
+    if (s === Infinity) return Infinity;
+
+    if (e.ts) {
+      const ageDays = (Date.now() - e.ts) / 86400000;
+      s -= Math.max(0, 60 - ageDays * 1.5);
+    }
+    if (e.bookmark) s -= 50;
+    if (e.visits) s -= Math.min(40, e.visits * 2);
+    return s;
+  }
+
+  function subset(u) {
     try {
-      const p = new URL(u, location.href);
-      const path = p.pathname.length > 60 ? p.pathname.slice(0, 60) + '…' : p.pathname;
-      return p.hostname + path;
-    } catch (e) {
-      return String(u).slice(0, 80);
-    }
+      const x = new URL(u);
+      const p = x.pathname.length > 48 ? x.pathname.slice(0, 48) + '…' : x.pathname;
+      return x.hostname.replace(/^www\./, '') + (p === '/' ? '' : p);
+    } catch (e) { return String(u).slice(0, 80); }
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 7. CSP STRIPPER
-  // ═══════════════════════════════════════════════════════════════════
-  function installCSPStripper() {
-    if (!settings.cspStrip) return;
+  function search(q, limit) {
+    limit = limit || 9;
+    q = String(q || '').trim();
 
-    const killMetas = (root) => {
-      if (!root || !root.querySelectorAll) return;
-      let metas;
-      try { metas = root.querySelectorAll('meta[http-equiv]'); } catch (e) { return; }
-      for (const m of metas) {
-        const eq = (m.getAttribute('http-equiv') || '').toLowerCase();
-        if (eq === 'content-security-policy' || eq === 'content-security-policy-report-only') {
-          try { m.remove(); } catch (e) {}
-        }
-      }
-    };
+    if (!q) {
+      const idx = searchIndex || buildIndex();
+      idx.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      return idx.slice(0, limit).map((e) => ({
+        type: e.bookmark ? 'bookmark' : 'history',
+        title: e.title || e.url,
+        url: e.url,
+        subtitle: subset(e.url)
+      }));
+    }
 
-    killMetas(document);
-    killMetas(document.head);
+    const results = [];
 
-    const obs = new MutationObserver((muts) => {
-      for (const m of muts) {
-        for (const n of m.addedNodes) {
-          if (!n || n.nodeType !== 1) continue;
-          if (n.tagName === 'META') {
-            const eq = (n.getAttribute('http-equiv') || '').toLowerCase();
-            if (eq === 'content-security-policy' || eq === 'content-security-policy-report-only') {
-              try { n.remove(); } catch (e) {}
-            }
-          } else if (n.querySelectorAll) {
-            killMetas(n);
-          }
-        }
-      }
+    if (looksLikeUrl(q)) {
+      results.push({ type: 'url', title: q, url: toUrl(q), subtitle: 'open' });
+    }
+
+    const idx = searchIndex || buildIndex();
+    const scored = [];
+    for (const e of idx) {
+      const s = scoreEntry(q, e);
+      if (s === Infinity) continue;
+      scored.push({ e, s });
+    }
+    scored.sort((a, b) => a.s - b.s);
+
+    const room = Math.max(1, limit - results.length - 1);
+    for (const { e } of scored.slice(0, room)) {
+      results.push({
+        type: e.bookmark ? 'bookmark' : 'history',
+        title: e.title || e.url,
+        url: e.url,
+        subtitle: subset(e.url)
+      });
+    }
+
+    const fn = ENGINES[settings.engine] || ENGINES.duckduckgo;
+    results.push({
+      type: 'search',
+      title: q,
+      url: fn(q),
+      subtitle: 'search · ' + settings.engine
     });
 
-    try {
-      obs.observe(document, { childList: true, subtree: true });
-    } catch (e) {}
+    return results.slice(0, limit);
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 8. FRAME-BUSTER NEUTRALIZER
-  // ═══════════════════════════════════════════════════════════════════
-  function installFrameBuster() {
-    if (!settings.frameBuster) return;
-    if (window.top === window.self) return;
+  // ══════════════════════════════════════════════════════════════════════════
+  // 6. CHILD RUNTIME — injected into every srcdoc iframe
+  //    Patches fetch + XHR + link clicks + window.open. Talks to parent.
+  // ══════════════════════════════════════════════════════════════════════════
+  function childRuntime(w) {
+    if (w.__ghostRuntime) return;
+    w.__ghostRuntime = true;
+    const B = w.parent && w.parent.ghostBrowser;
+    if (!B) return;
 
-    // We're inside an iframe. Neutralize top/parent rebinding.
-    try {
-      Object.defineProperty(window, 'top', { value: window.self, configurable: true });
-    } catch (e) {}
-    try {
-      Object.defineProperty(window, 'parent', { value: window.self, configurable: true });
-    } catch (e) {}
-    try {
-      Object.defineProperty(window, 'frameElement', { value: null, configurable: true });
-    } catch (e) {}
+    // ── neutralize frame-busters ──
+    try { Object.defineProperty(w, 'top', { get: () => w, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(w, 'parent', { get: () => w, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(w, 'frameElement', { get: () => null, configurable: true }); } catch (e) {}
+    try { w.onbeforeunload = null; } catch (e) {}
 
-    // Kill onbeforeunload frame-busting redirects
-    try {
-      Object.defineProperty(window, 'onbeforeunload', { value: null, configurable: true, writable: true });
-    } catch (e) {}
+    // ── patch fetch ──
+    const nFetch = w.fetch;
+    if (nFetch) {
+      w.fetch = async function (input, init) {
+        init = init || {};
+        let url, method = 'GET', headers = {}, body = null;
 
-    // Best-effort: strip our own sandbox attribute
-    try {
-      const fe = window.frameElement;
-      if (fe && fe.hasAttribute && fe.hasAttribute('sandbox')) {
-        fe.removeAttribute('sandbox');
-      }
-    } catch (e) {}
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // 9. FETCH PATCH
-  // ═══════════════════════════════════════════════════════════════════
-  const nativeFetch = (typeof window.fetch === 'function') ? window.fetch.bind(window) : null;
-
-  function installFetchPatch() {
-    if (!settings.patchFetch || !nativeFetch) return;
-
-    const ghostFetch = async function (input, init) {
-      init = init || {};
-
-      let url, method, reqHeaders = {}, body, credentials, signal, mode, cache, redirect, referrer, referrerPolicy;
-
-      try {
-        if (typeof Request !== 'undefined' && input instanceof Request) {
-          url = input.url;
-          method = (init.method || input.method || 'GET').toUpperCase();
-          reqHeaders = Object.assign({}, headersToObject(input.headers), headersToObject(init.headers));
-          body = init.body !== undefined ? init.body : input.body;
-          credentials = init.credentials || input.credentials || 'same-origin';
-          signal = init.signal || input.signal;
-          mode = init.mode || input.mode || 'cors';
-          cache = init.cache || input.cache || 'default';
-          redirect = init.redirect || input.redirect || 'follow';
-          referrer = init.referrer !== undefined ? init.referrer : input.referrer;
-          referrerPolicy = init.referrerPolicy || input.referrerPolicy;
-        } else {
-          url = String(input);
-          method = (init.method || 'GET').toUpperCase();
-          reqHeaders = headersToObject(init.headers);
-          body = init.body;
-          credentials = init.credentials || 'same-origin';
-          signal = init.signal;
-          mode = init.mode || 'cors';
-          cache = init.cache || 'default';
-          redirect = init.redirect || 'follow';
-          referrer = init.referrer;
-          referrerPolicy = init.referrerPolicy;
-        }
-
-        const absolute = new URL(url, location.href).href;
-
-        // Same-origin → let native fetch handle it
-        if (!isCrossOrigin(absolute)) {
-          return nativeFetch(input, init);
-        }
-
-        const start = Date.now();
-        const { headers: reqFinal } = applyRequestRules(absolute, reqHeaders);
-        const gmBody = await bodyToGM(body);
-
-        if (signal && signal.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-
-        const resp = await new Promise((resolve, reject) => {
-          const reqObj = gm.xhr({
-            method,
-            url: absolute,
-            headers: reqFinal,
-            data: gmBody,
-            responseType: 'arraybuffer',
-            timeout: 0,
-            withCredentials: credentials === 'include',
-            onload: (r) => resolve(r),
-            onerror: (r) => reject(new Error('Ghost network error')),
-            ontimeout: () => reject(new Error('Ghost timeout')),
-            onabort: () => reject(new DOMException('Aborted', 'AbortError'))
-          });
-
-          if (signal) {
-            const onAbort = () => {
-              try { reqObj.abort(); } catch (e) {}
-              reject(new DOMException('Aborted', 'AbortError'));
-            };
-            if (signal.aborted) onAbort();
-            else signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          if (w.Request && input instanceof w.Request) {
+            url = input.url;
+            method = (init.method || input.method || 'GET').toUpperCase();
+            const h = new w.Headers(input.headers || {});
+            if (init.headers) new w.Headers(init.headers).forEach((v, k) => h.set(k, v));
+            headers = {};
+            h.forEach((v, k) => { headers[k] = v; });
+            if (init.body !== undefined) body = init.body;
+            else if (method !== 'GET' && method !== 'HEAD') {
+              try { body = await input.clone().text(); } catch (e) {}
+            }
+          } else {
+            url = String(input);
+            method = (init.method || 'GET').toUpperCase();
+            if (init.headers) {
+              if (w.Headers && init.headers instanceof w.Headers) init.headers.forEach((v, k) => { headers[k] = v; });
+              else if (Array.isArray(init.headers)) init.headers.forEach((p) => { headers[p[0]] = p[1]; });
+              else Object.assign(headers, init.headers);
+            }
+            body = init.body;
           }
-        });
-
-        let buffer = null;
-        if (resp.response instanceof ArrayBuffer) {
-          buffer = resp.response;
-        } else if (resp.response != null) {
-          const enc = new TextEncoder().encode(String(resp.response));
-          buffer = enc.buffer;
-        } else {
-          buffer = new ArrayBuffer(0);
+        } catch (e) {
+          if (nFetch) return nFetch.call(w, input, init);
+          throw e;
         }
 
-        const rawHeaders = parseGMHeaders(resp.responseHeaders);
-        const contentType = rawHeaders['Content-Type'] || rawHeaders['content-type'] || '';
+        let absolute;
+        try { absolute = new URL(url, w.location.href).href; } catch (e) { absolute = url; }
 
-        const rewrite = await applyBodyRules(absolute, contentType, buffer);
-        if (rewrite.changed) buffer = rewrite.buffer;
+        // Same-origin to our shell → hand to native
+        let sameShell = false;
+        try { sameShell = new URL(absolute).origin === w.location.origin; } catch (e) {}
+        if (sameShell) return nFetch.call(w, input, init);
 
-        const applied = applyResponseRules(absolute, rawHeaders);
-        const duration = Date.now() - start;
-
-        const response = makeResponse(
-          resp.status || 200,
-          resp.statusText || '',
-          applied.headers,
-          buffer
-        );
-
-        logStore.push({
-          method,
-          url: absolute,
-          status: resp.status || 0,
-          statusText: resp.statusText || '',
-          bytes: buffer.byteLength,
-          duration,
-          crossOrigin: true,
-          contentType,
-          reqHeaders: reqFinal,
-          resHeaders: applied.headers
-        });
-
-        return response;
-      } catch (err) {
-        if (err && err.name === 'AbortError') throw err;
-        if (settings.verbose && typeof console !== 'undefined') {
-          console.warn('[ghost] fetch patch failed, falling back');
+        try {
+          const r = await B.fetch(absolute, method, headers, body);
+          const respHeaders = new w.Headers();
+          for (const [k, v] of Object.entries(r.headers || {})) {
+            try { respHeaders.set(k, String(v)); } catch (e) {}
+          }
+          const noBody = r.status === 204 || r.status === 205 || r.status === 304;
+          return new w.Response(noBody ? null : r.buffer, {
+            status: r.status,
+            statusText: r.statusText,
+            headers: respHeaders
+          });
+        } catch (e) {
+          if (nFetch) return nFetch.call(w, input, init);
+          throw e;
         }
-        return nativeFetch(input, init);
-      }
+      };
+    }
+
+    // ── patch XHR ──
+    const NativeXHR = w.XMLHttpRequest;
+    if (NativeXHR) {
+      const GhostXHR = function () {
+        const x = new NativeXHR();
+        let _method = 'GET', _url = '';
+
+        const oOpen = x.open;
+        x.open = function (m, u) {
+          _method = (m || 'GET').toUpperCase();
+          try { _url = new URL(u, w.location.href).href; } catch (e) { _url = String(u); }
+          return oOpen.apply(x, arguments);
+        };
+
+        const oSend = x.send;
+        x.send = function (body) {
+          let cross = false;
+          try { cross = new URL(_url).origin !== w.location.origin; } catch (e) { cross = false; }
+          if (!cross) return oSend.call(x, body);
+
+          // GM route
+          const normalizedBody = (body == null) ? undefined :
+            (typeof body === 'string' ? body :
+             (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer ? body :
+              (typeof body === 'object' && body.toString ? body.toString() : String(body))));
+
+          B.fetch(_url, _method, {}, normalizedBody).then((r) => {
+            const text = safeDecode(r.buffer);
+            try {
+              Object.defineProperty(x, 'readyState', { value: 4, configurable: true });
+              Object.defineProperty(x, 'status', { value: r.status, configurable: true });
+              Object.defineProperty(x, 'statusText', { value: r.statusText, configurable: true });
+              Object.defineProperty(x, 'responseText', { value: text, configurable: true });
+              Object.defineProperty(x, 'response', {
+                value: x.responseType === 'json' ? safeJson(text) : text,
+                configurable: true
+              });
+              Object.defineProperty(x, 'responseURL', { value: _url, configurable: true });
+              x.getAllResponseHeaders = () => Object.entries(r.headers || {}).map(([k, v]) => k + ': ' + v).join('\r\n');
+              x.getResponseHeader = (name) => {
+                const t = String(name).toLowerCase();
+                for (const [k, v] of Object.entries(r.headers || {})) if (k.toLowerCase() === t) return v;
+                return null;
+              };
+            } catch (e) {}
+            fire(x, 'readystatechange');
+            fire(x, 'load');
+            fire(x, 'loadend');
+          }).catch(() => {
+            try {
+              Object.defineProperty(x, 'readyState', { value: 4, configurable: true });
+              Object.defineProperty(x, 'status', { value: 0, configurable: true });
+            } catch (e) {}
+            fire(x, 'readystatechange');
+            fire(x, 'error');
+            fire(x, 'loadend');
+          });
+        };
+
+        return x;
+      };
+      GhostXHR.UNSENT = 0;
+      GhostXHR.OPENED = 1;
+      GhostXHR.HEADERS_RECEIVED = 2;
+      GhostXHR.LOADING = 3;
+      GhostXHR.DONE = 4;
+      try { Object.defineProperty(w, 'XMLHttpRequest', { value: GhostXHR, configurable: true, writable: true }); }
+      catch (e) { w.XMLHttpRequest = GhostXHR; }
+    }
+
+    function fire(target, type) {
+      try { const h = target['on' + type]; if (typeof h === 'function') h.call(target, { type, target }); } catch (e) {}
+      try { target.dispatchEvent(new w.Event(type)); } catch (e) {}
+    }
+
+    function safeDecode(buf) {
+      try { return new TextDecoder('utf-8').decode(new Uint8Array(buf)); } catch (e) { return ''; }
+    }
+    function safeJson(t) { try { return JSON.parse(t); } catch (e) { return null; } }
+
+    // ── intercept link clicks ──
+    w.document.addEventListener('click', (e) => {
+      if (e.defaultPrevented) return;
+      const a = e.target && e.target.closest && e.target.closest('a[href]');
+      if (!a) return;
+      const href = a.getAttribute('href');
+      if (!href) return;
+      if (href.startsWith('#')) return;
+      if (/^(javascript|mailto|tel|blob|data):/i.test(href)) return;
+
+      let abs;
+      try { abs = new URL(href, w.location.href).href; } catch (err) { return; }
+      if (!/^https?:/i.test(abs)) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      B.navigate(abs, e.ctrlKey || e.metaKey || e.shiftKey);
+    }, true);
+
+    // ── intercept window.open ──
+    const oOpen = w.open;
+    w.open = function (url) {
+      if (!url) return null;
+      let abs;
+      try { abs = new URL(url, w.location.href).href; } catch (e) { return null; }
+      if (!/^https?:/i.test(abs)) return null;
+      B.navigate(abs, true);
+      return null;
     };
 
-    try {
-      Object.defineProperty(window, 'fetch', {
-        value: ghostFetch,
-        configurable: true,
-        writable: true
-      });
-    } catch (e) {
-      window.fetch = ghostFetch;
-    }
+    // ── history API interception ──
+    const oPush = w.history.pushState;
+    const oReplace = w.history.replaceState;
+    w.history.pushState = function (s, t, u) {
+      try {
+        if (u) {
+          const abs = new URL(u, w.location.href).href;
+          B.historyPush(abs);
+        }
+      } catch (e) {}
+      return oPush.apply(w.history, arguments);
+    };
+    w.history.replaceState = function (s, t, u) {
+      try {
+        if (u) {
+          const abs = new URL(u, w.location.href).href;
+          B.historyReplace(abs);
+        }
+      } catch (e) {}
+      return oReplace.apply(w.history, arguments);
+    };
+
+    // ── report ready ──
+    try { B.ready(w.location.href, w.document.title || ''); } catch (e) {}
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 10. XHR PATCH
-  // ═══════════════════════════════════════════════════════════════════
-  const NativeXHR = window.XMLHttpRequest;
-
-  function installXHRPatch() {
-    if (!settings.patchXHR || !NativeXHR) return;
-
-    class GhostXHR extends EventTarget {
-      constructor() {
-        super();
-        this._m = 'GET';
-        this._u = '';
-        this._async = true;
-        this._user = null;
-        this._pw = null;
-        this._reqHeaders = {};
-        this._readyState = 0;
-        this._status = 0;
-        this._statusText = '';
-        this._response = null;
-        this._responseText = '';
-        this._responseType = '';
-        this._responseURL = '';
-        this._withCredentials = false;
-        this._timeout = 0;
-        this._overrideMime = null;
-        this._resHeaders = null;
-        this._reqObj = null;
-        this._running = false;
-
-        // handler slots, populated by assignment
-        this.onreadystatechange = null;
-        this.onload = null;
-        this.onerror = null;
-        this.onprogress = null;
-        this.onabort = null;
-        this.onloadstart = null;
-        this.onloadend = null;
-        this.ontimeout = null;
-
-        // Static event names for addEventListener users
-        this.UNSENT = 0;
-        this.OPENED = 1;
-        this.HEADERS_RECEIVED = 2;
-        this.LOADING = 3;
-        this.DONE = 4;
-      }
-
-      get readyState() { return this._readyState; }
-      get status() { return this._status; }
-      get statusText() { return this._statusText; }
-      get response() { return this._response; }
-      get responseText() { return this._responseText; }
-      get responseURL() { return this._responseURL; }
-
-      get responseType() { return this._responseType; }
-      set responseType(v) { this._responseType = String(v || ''); }
-
-      get timeout() { return this._timeout; }
-      set timeout(v) { this._timeout = Number(v) || 0; }
-
-      get withCredentials() { return this._withCredentials; }
-      set withCredentials(v) { this._withCredentials = !!v; }
-
-      open(method, url, async, user, pw) {
-        this._m = (method || 'GET').toUpperCase();
-        this._u = String(url || '');
-        this._async = async !== false;
-        this._user = user != null ? user : null;
-        this._pw = pw != null ? pw : null;
-        this._readyState = 1;
-        this._status = 0;
-        this._statusText = '';
-        this._response = null;
-        this._responseText = '';
-        this._responseURL = '';
-        this._resHeaders = null;
-        this._reqHeaders = {};
-        this._running = false;
-        this._fire('readystatechange');
-      }
-
-      setRequestHeader(name, value) {
-        if (!name) return;
-        this._reqHeaders[String(name)] = this._reqHeaders[String(name)]
-          ? (this._reqHeaders[String(name)] + ', ' + String(value))
-          : String(value);
-      }
-
-      getResponseHeader(name) {
-        if (!this._resHeaders) return null;
-        const target = String(name || '').toLowerCase();
-        for (const [k, v] of Object.entries(this._resHeaders)) {
-          if (k.toLowerCase() === target) return v;
-        }
-        return null;
-      }
-
-      getAllResponseHeaders() {
-        if (!this._resHeaders) return '';
-        return Object.entries(this._resHeaders)
-          .map(([k, v]) => k + ': ' + v)
-          .join('\r\n');
-      }
-
-      overrideMimeType(mime) {
-        this._overrideMime = String(mime || '');
-      }
-
-      abort() {
-        this._running = false;
-        if (this._reqObj && this._reqObj.abort) {
-          try { this._reqObj.abort(); } catch (e) {}
-        }
-        try {
-          this._fire('abort');
-          this._fire('loadend');
-        } catch (e) {}
-        this._readyState = 4;
-        this._fire('readystatechange');
-      }
-
-      _fire(type) {
-        const evt = { type, target: this, currentTarget: this, timeStamp: Date.now() };
-
-        const handler = this['on' + type];
-        if (typeof handler === 'function') {
-          try { handler.call(this, evt); } catch (e) {
-            if (settings.verbose) console.error('[ghost] xhr handler threw', e);
-          }
-        }
-
-        try {
-          super.dispatchEvent(Object.assign(new Event(type), evt));
-        } catch (e) {}
-      }
-
-      send(body) {
-        const self = this;
-        const absolute = new URL(this._u, location.href).href;
-
-        // Same-origin → hand off to native XHR
-        if (!isCrossOrigin(absolute)) {
-          const x = new NativeXHR();
-          x.open(this._m, absolute, this._async, this._user, this._pw);
-          if (this._responseType) x.responseType = this._responseType;
-          x.withCredentials = this._withCredentials;
-          if (this._timeout) x.timeout = this._timeout;
-          for (const [k, v] of Object.entries(this._reqHeaders)) {
-            try { x.setRequestHeader(k, v); } catch (e) {}
-          }
-          if (this._overrideMime) x.overrideMimeType(this._overrideMime);
-
-          x.onreadystatechange = () => {
-            self._readyState = x.readyState;
-            self._status = x.status;
-            self._statusText = x.statusText;
-            self._response = x.response;
-            self._responseText = x.responseText;
-            self._responseURL = x.responseURL || absolute;
-            self._resHeaders = parseGMHeaders(x.getAllResponseHeaders());
-            self._fire('readystatechange');
-          };
-          x.onload = () => self._fire('load');
-          x.onerror = () => self._fire('error');
-          x.onabort = () => self._fire('abort');
-          x.ontimeout = () => self._fire('timeout');
-          x.onloadend = () => self._fire('loadend');
-
-          this._reqObj = x;
-          this._running = true;
-          x.send(body == null ? null : body);
-          return;
-        }
-
-        // Cross-origin → GM route
-        this._running = true;
-        this._readyState = 1;
-        this._fire('readystatechange');
-        this._fire('loadstart');
-
-        const start = Date.now();
-        const { headers: reqFinal } = applyRequestRules(absolute, this._reqHeaders);
-
-        Promise.resolve(bodyToGM(body)).then((gmBody) => {
-          const reqObj = gm.xhr({
-            method: this._m,
-            url: absolute,
-            headers: reqFinal,
-            data: gmBody,
-            responseType: 'arraybuffer',
-            timeout: this._timeout || 0,
-            withCredentials: this._withCredentials,
-            onload: async (r) => {
-              if (!self._running) return;
-
-              self._readyState = 2;
-              self._fire('readystatechange');
-
-              let buffer = null;
-              if (r.response instanceof ArrayBuffer) buffer = r.response;
-              else if (r.response != null) buffer = new TextEncoder().encode(String(r.response)).buffer;
-              else buffer = new ArrayBuffer(0);
-
-              const rawHeaders = parseGMHeaders(r.responseHeaders);
-              const contentType = rawHeaders['Content-Type'] || rawHeaders['content-type'] || '';
-
-              validBody = await applyBodyRules(absolute, contentType, buffer);
-              if (validBody.changed) buffer = validBody.buffer;
-
-              const applied = applyResponseRules(absolute, rawHeaders);
-
-              self._readyState = 3;
-              self._fire('readystatechange');
-
-              let finalBuffer = buffer;
-              if (self._overrideMime || (self._responseType && self._responseType !== 'arraybuffer' && self._responseType !== 'blob')) {
-                // no-op, buffer stays
-              }
-
-              try {
-                if (self._responseType === 'blob') {
-                  self._response = new Blob([finalBuffer]);
-                  self._responseText = '';
-                } else if (self._responseType === 'arraybuffer') {
-                  self._response = finalBuffer;
-                  self._responseText = '';
-                } else if (self._responseType === 'json') {
-                  try {
-                    self._responseText = new TextDecoder('utf-8').decode(new Uint8Array(finalBuffer));
-                    self._response = JSON.parse(self._responseText);
-                  } catch (e) {
-                    self._response = null;
-                    self._responseText = '';
-                  }
-                } else {
-                  self._responseText = new TextDecoder('utf-8').decode(new Uint8Array(finalBuffer));
-                  self._response = self._responseText;
-                }
-              } catch (e) {
-                self._response = finalBuffer;
-                self._responseText = '';
-              }
-
-              self._status = r.status || 200;
-              self._statusText = r.statusText || '';
-              self._responseURL = absolute;
-              self._resHeaders = applied.headers;
-              self._readyState = 4;
-
-              logStore.push({
-                method: self._m,
-                url: absolute,
-                status: self._status,
-                statusText: self._statusText,
-                bytes: encodeURIComponent(self._responseText || '').length,
-                duration: Date.now() - start,
-                crossOrigin: true,
-                contentType,
-                reqHeaders: reqFinal,
-                resHeaders: applied.headers
-              });
-
-              self._fire('readystatechange');
-              self._fire('load');
-              self._fire('loadend');
-              self._running = false;
-            },
-            onerror: () => {
-              if (!self._running) return;
-              self._status = 0;
-              self._readyState = 4;
-              logStore.push({
-                method: self._m,
-                url: absolute,
-                status: 0,
-                blocked: true,
-                duration: Date.now() - start,
-                crossOrigin: true,
-                reqHeaders: reqFinal
-              });
-              self._fire('readystatechange');
-              self._fire('error');
-              self._fire('loadend');
-              self._running = false;
-            },
-            ontimeout: () => {
-              if (!self._running) return;
-              self._status = 0;
-              self._readyState = 4;
-              self._fire('readystatechange');
-              self._fire('timeout');
-              self._fire('loadend');
-              self._running = false;
-            },
-            onabort: () => {
-              if (!self._running) return;
-              self._status = 0;
-              self._readyState = 4;
-              self._fire('readystatechange');
-              self._fire('abort');
-              self._fire('loadend');
-              self._running = false;
-            }
-          });
-
-          self._reqObj = reqObj;
-        }).catch(() => {
-          self._fire('error');
-          self._fire('loadend');
-        });
-      }
-    }
-
-    try {
-      Object.defineProperty(window, 'XMLHttpRequest', {
-        value: GhostXHR,
-        configurable: true,
-        writable: true
-      });
-    } catch (e) {
-      window.XMLHttpRequest = GhostXHR;
-    }
+  // ══════════════════════════════════════════════════════════════════════════
+  // 7. HTML REWRITER
+  // ══════════════════════════════════════════════════════════════════════════
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 11. HAR EXPORT
-  // ═══════════════════════════════════════════════════════════════════
-  function buildHAR(entries) {
-    const filtered = entries.filter((e) => e && !e.__clear && e.url);
+  function rewriteHtml(html, originalUrl) {
+    if (!html) return html;
+
+    // strip CSP meta and XFO meta
+    html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy[^>]*>/gi, '');
+    html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?x-frame-options[^>]*>/gi, '');
+
+    // strip integrity + crossorigin on script/link so hashes don't fail
+    if (settings.stripIntegrity) {
+      html = html.replace(/\sintegrity\s*=\s*["'][^"']*["']/gi, '');
+      html = html.replace(/\scrossorigin(\s*=\s*["'][^"']*["'])?/gi, '');
+    }
+
+    // remove any existing base tag (we install our own)
+    html = html.replace(/<base\b[^>]*>/gi, '');
+
+    // insert base + runtime right after <head>
+    const base = '<base href="' + escapeAttr(originalUrl) + '">';
+    const runtime = '<script>(' + childRuntime.toString() + ')(window);</script>';
+    const inject = base + runtime;
+
+    if (/<head\b[^>]*>/i.test(html)) {
+      html = html.replace(/<head\b[^>]*>/i, (m) => m + inject);
+    } else if (/<html\b[^>]*>/i.test(html)) {
+      html = html.replace(/<html\b[^>]*>/i, (m) => m + '<head>' + inject + '</head>');
+    } else {
+      html = '<head>' + inject + '</head>' + html;
+    }
+    return html;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 8. FETCHER (parent-side, GM routed)
+  // ══════════════════════════════════════════════════════════════════════════
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+  const DEFAULT_REQ_HEADERS = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache'
+  };
+
+  async function ghostFetch(url, method, headers, body) {
+    const finalHeaders = Object.assign({}, DEFAULT_REQ_HEADERS, headers || {});
+    const r = await gmFetch({
+      url,
+      method: method || 'GET',
+      headers: finalHeaders,
+      body,
+      responseType: 'arraybuffer'
+    });
+
+    let buffer = r.response;
+    if (!(buffer instanceof ArrayBuffer)) {
+      if (buffer == null) buffer = new ArrayBuffer(0);
+      else if (typeof buffer === 'string') buffer = new TextEncoder().encode(buffer).buffer;
+      else buffer = new ArrayBuffer(0);
+    }
+
+    return {
+      status: r.status,
+      statusText: r.statusText || '',
+      headers: r.headers || {},
+      buffer,
+      finalUrl: r.finalUrl || url
+    };
+  }
+
+  async function loadPage(url) {
+    const r = await ghostFetch(url, 'GET', {}, undefined);
+    const contentType = r.headers['Content-Type'] || r.headers['content-type'] || '';
+    const text = new TextDecoder('utf-8').decode(new Uint8Array(r.buffer));
+    const isHtml = /text\/html|application\/xhtml/i.test(contentType) || /<html|<head|<body/i.test(text.slice(0, 400));
+
+    if (isHtml) {
+      return { kind: 'html', html: rewriteHtml(text, url), url, status: r.status, headers: r.headers };
+    }
+    return { kind: 'raw', text, url, status: r.status, headers: r.headers };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9. LOG STORE (for HAR + HUD)
+  // ══════════════════════════════════════════════════════════════════════════
+  const LOG_MAX = 1000;
+  const logRing = [];
+  const logSubs = new Set();
+  let logSeq = 0;
+
+  function logPush(entry) {
+    logSeq += 1;
+    const rec = {
+      id: logSeq,
+      ts: Date.now(),
+      method: (entry.method || 'GET').toUpperCase(),
+      url: entry.url || '',
+      status: entry.status || 0,
+      statusText: entry.statusText || '',
+      duration: entry.duration || 0,
+      bytes: entry.bytes || 0,
+      contentType: entry.contentType || '',
+      crossOrigin: !!entry.crossOrigin,
+      blocked: !!entry.blocked,
+      reqHeaders: entry.reqHeaders || null,
+      resHeaders: entry.resHeaders || null
+    };
+    logRing.push(rec);
+    if (logRing.length > LOG_MAX) logRing.shift();
+    for (const fn of logSubs) { try { fn(rec); } catch (e) {} }
+    return rec;
+  }
+
+  function logAll() { return logRing.slice(); }
+  function logClear() {
+    logRing.length = 0;
+    for (const fn of logSubs) { try { fn({ id: 0, __clear: true, ts: Date.now() }); } catch (e) {} }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 10. HAR EXPORT
+  // ══════════════════════════════════════════════════════════════════════════
+  function buildHAR() {
+    const entries = logAll().filter((e) => e && !e.__clear && e.url);
     return {
       log: {
         version: '1.2',
-        creator: { name: 'Ghost', version: '1.0.0' },
-        browser: { name: 'Ghost', version: '1.0.0' },
+        creator: { name: 'Ghost Browser', version: '2.0.0' },
+        browser: { name: 'Ghost Browser', version: '2.0.0' },
         pages: [{
-          startedDateTime: filtered.length ? new Date(filtered[0].ts).toISOString() : new Date().toISOString(),
+          startedDateTime: entries.length ? new Date(entries[0].ts).toISOString() : new Date().toISOString(),
           id: 'page_1',
           title: document.title || 'Ghost session',
           pageTimings: { onContentLoad: -1, onLoad: -1 }
         }],
-        entries: filtered.map((rec) => {
+        entries: entries.map((rec) => {
           const h2a = (h) => Object.entries(h || {}).map(([name, value]) => ({ name, value: String(value) }));
           return {
             pageref: 'page_1',
@@ -1047,10 +714,8 @@
               cookies: [],
               headers: h2a(rec.reqHeaders),
               queryString: (() => {
-                try {
-                  const u = new URL(rec.url);
-                  return [...u.searchParams.entries()].map(([name, value]) => ({ name, value }));
-                } catch (e) { return []; }
+                try { const u = new URL(rec.url); return [...u.searchParams.entries()].map(([name, value]) => ({ name, value })); }
+                catch (e) { return []; }
               })(),
               headersSize: -1,
               bodySize: 0
@@ -1061,22 +726,14 @@
               httpVersion: 'HTTP/1.1',
               cookies: [],
               headers: h2a(rec.resHeaders),
-              content: {
-                size: rec.bytes || 0,
-                mimeType: rec.contentType || 'application/octet-stream',
-                text: ''
-              },
+              content: { size: rec.bytes || 0, mimeType: rec.contentType || 'application/octet-stream', text: '' },
               redirectURL: '',
               headersSize: -1,
               bodySize: rec.bytes || 0
             },
             cache: {},
             timings: { send: 0, wait: rec.duration || 0, receive: 0 },
-            _ghost: {
-              id: rec.id,
-              crossOrigin: !!rec.crossOrigin,
-              blocked: !!rec.blocked
-            }
+            _ghost: { id: rec.id, crossOrigin: !!rec.crossOrigin, blocked: !!rec.blocked }
           };
         })
       }
@@ -1084,7 +741,7 @@
   }
 
   function exportHAR() {
-    const har = buildHAR(logStore.all());
+    const har = buildHAR();
     const blob = new Blob([JSON.stringify(har, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1096,631 +753,1044 @@
     setTimeout(() => {
       try { document.body.removeChild(a); } catch (e) {}
       URL.revokeObjectURL(url);
-    }, 500);
+    }, 400);
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 12. HUD — the little floating panel
-  // ═══════════════════════════════════════════════════════════════════
-  function mountHUD() {
-    if (document.getElementById('ghost-hud-root')) return;
+  // ══════════════════════════════════════════════════════════════════════════
+  // 11. TAB MODEL
+  // ══════════════════════════════════════════════════════════════════════════
+  let tabSeq = 0;
+  const tabs = [];
+  let activeTab = null;
 
+  function createTab(url, opts) {
+    opts = opts || {};
+    const id = ++tabSeq;
+    const iframe = document.createElement('iframe');
+    iframe.className = 'gb-frame';
+    iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation allow-downloads');
+    iframe.setAttribute('referrerpolicy', 'no-referrer');
+    iframe.dataset.tabId = String(id);
+    iframe.style.display = 'none';
+
+    const tab = {
+      id, iframe,
+      title: opts.title || 'New Tab',
+      url: '',
+      history: [],
+      historyIdx: -1,
+      favicon: null,
+      loaded: false
+    };
+    tabs.push(tab);
+
+    const vp = ui.viewport;
+    if (vp) vp.appendChild(iframe);
+
+    if (url) {
+      navigateTab(tab, url, { replaceHistory: true });
+    } else {
+      showNewTab(tab);
+    }
+
+    renderTabStrip();
+    if (!opts.background) setActiveTab(tab);
+    return tab;
+  }
+
+  function closeTab(id) {
+    const idx = tabs.findIndex((t) => t.id === id);
+    if (idx === -1) return;
+    const [tab] = tabs.splice(idx, 1);
+    try { tab.iframe.remove(); } catch (e) {}
+    renderTabStrip();
+    if (activeTab === tab) {
+      const next = tabs[Math.min(idx, tabs.length - 1)];
+      if (next) setActiveTab(next);
+      else createTab();
+    }
+  }
+
+  function setActiveTab(tab) {
+    if (activeTab === tab) { syncOmniboxToTab(); return; }
+    activeTab = tab;
+    for (const t of tabs) {
+      t.iframe.style.display = (t === tab) ? 'block' : 'none';
+    }
+    renderTabStrip();
+    syncOmniboxToTab();
+    updateNavButtons();
+    focusOmnibox(false);
+    closeResults();
+  }
+
+  function syncOmniboxToTab() {
+    if (!activeTab) return;
+    const omnibox = ui.omnibox;
+    if (document.activeElement === omnibox) return;
+    omnibox.value = activeTab.url || '';
+  }
+
+  function updateNavButtons() {
+    if (!ui.back || !ui.forward) return;
+    if (!activeTab) {
+      ui.back.disabled = true;
+      ui.forward.disabled = true;
+      return;
+    }
+    ui.back.disabled = activeTab.historyIdx <= 0;
+    ui.forward.disabled = activeTab.historyIdx >= activeTab.history.length - 1;
+  }
+
+  async function navigateTab(tab, url, options) {
+    options = options || {};
+    url = url || '';
+    if (!/^https?:/i.test(url)) url = toUrl(url);
+    tab.url = url;
+    tab.title = subset(url);
+    tab.loaded = false;
+    renderTabStrip();
+
+    if (options.replaceHistory) {
+      if (tab.historyIdx >= 0 && tab.historyIdx < tab.history.length - 1) {
+        tab.history.splice(tab.historyIdx + 1);
+      }
+      tab.history.push(url);
+      tab.historyIdx = tab.history.length - 1;
+    } else if (options.noHistory) {
+      // skip
+    } else {
+      if (tab.historyIdx >= 0 && tab.history[tab.historyIdx] === url) {
+        // same URL, just reload content
+      } else {
+        if (tab.historyIdx < tab.history.length - 1) {
+          tab.history.splice(tab.historyIdx + 1);
+        }
+        tab.history.push(url);
+        tab.historyIdx = tab.history.length - 1;
+      }
+    }
+
+    // show loading overlay
+    showLoading(tab, url);
+
+    const start = Date.now();
+    try {
+      const result = await loadPage(url);
+      logPush({
+        method: 'GET',
+        url,
+        status: result.status,
+        duration: Date.now() - start,
+        bytes: result.kind === 'html' ? result.html.length : (result.text || '').length,
+        contentType: result.headers['Content-Type'] || result.headers['content-type'] || '',
+        crossOrigin: true,
+        reqHeaders: Object.assign({}, DEFAULT_REQ_HEADERS),
+        resHeaders: result.headers
+      });
+
+      if (result.kind === 'html') {
+        tab.iframe.srcdoc = result.html;
+      } else {
+        // raw content — wrap in <pre> for safety
+        tab.iframe.srcdoc = '<!doctype html><base href="' + escapeAttr(url) + '"><pre style="white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;padding:1rem;color:#e6e8eb;background:#0b0d10">' +
+          escapeAttr(result.text).replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&lt;/g, '<') +
+          '</pre>';
+      }
+
+      tab.loaded = true;
+      historyAdd(url, tab.title);
+      invalidateIndex();
+      syncOmniboxToTab();
+      updateNavButtons();
+      renderTabStrip();
+    } catch (err) {
+      showError(tab, url, err.message || String(err));
+      logPush({
+        method: 'GET',
+        url,
+        status: 0,
+        blocked: true,
+        duration: Date.now() - start,
+        crossOrigin: true,
+        reqHeaders: Object.assign({}, DEFAULT_REQ_HEADERS)
+      });
+    }
+  }
+
+  function showLoading(tab, url) {
+    tab.iframe.srcdoc =
+      '<!doctype html><html><head><base href="' + escapeAttr(url) + '"><style>' +
+      'html,body{margin:0;height:100%;background:#0b0d10;color:#5a636e;' +
+      'font:12px ui-monospace,monospace;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px}' +
+      '.d{width:24px;height:24px;border-radius:50%;border:2px solid #1c2027;border-top-color:#3b82f6;animation:spin .8s linear infinite}' +
+      '@keyframes spin{to{transform:rotate(360deg)}}' +
+      '</style></head><body>' +
+      '<div class="d"></div>' +
+      '<div>loading ' + escapeAttr(subset(url)) + '</div>' +
+      '</body></html>';
+  }
+
+  function showError(tab, url, message) {
+    tab.iframe.srcdoc =
+      '<!doctype html><html><head><base href="' + escapeAttr(url) + '"><style>' +
+      'html,body{margin:0;height:100%;background:#0b0d10;color:#9aa3ad;' +
+      'font:12px ui-monospace,monospace;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:2rem;text-align:center}' +
+      '.t{color:#ef4444;font-size:14px;letter-spacing:.5px}' +
+      '.u{color:#5a636e;word-break:break-all;max-width:640px}' +
+      'button{background:#14171c;color:#9aa3ad;border:1px solid #1c2027;border-radius:6px;padding:8px 16px;cursor:pointer;font:inherit}' +
+      'button:hover{background:#1c2027;color:#e6e8eb}' +
+      '</style></head><body>' +
+      '<div class="t">failed to load</div>' +
+      '<div class="u">' + escapeAttr(url) + '</div>' +
+      '<div class="u">' + escapeAttr(message) + '</div>' +
+      '<button onclick="location.reload()">retry</button>' +
+      '</body></html>';
+  }
+
+  function navigateActive(url, background) {
+    if (background) { createTab(url, { background: true }); return; }
+    if (!activeTab) { createTab(url); return; }
+    navigateTab(activeTab, url);
+  }
+
+  function back() {
+    if (!activeTab || activeTab.historyIdx <= 0) return;
+    activeTab.historyIdx -= 1;
+    const url = activeTab.history[activeTab.historyIdx];
+    navigateTab(activeTab, url, { noHistory: true });
+  }
+
+  function forward() {
+    if (!activeTab || activeTab.historyIdx >= activeTab.history.length - 1) return;
+    activeTab.historyIdx += 1;
+    const url = activeTab.history[activeTab.historyIdx];
+    navigateTab(activeTab, url, { noHistory: true });
+  }
+
+  function reloadActive() {
+    if (!activeTab || !activeTab.url) return;
+    navigateTab(activeTab, activeTab.url, { noHistory: true });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 12. NEW TAB PAGE (rendered inside the iframe)
+  // ══════════════════════════════════════════════════════════════════════════
+  function newTabHtml() {
+    const top = historyRecent(8);
+    const bms = bmAll().slice(0, 8);
+    const recentHtml = top.length
+      ? top.map((e) =>
+          '<a class="card" href="' + escapeAttr(e.url) + '">' +
+            '<span class="ct">' + escapeAttr(e.title || e.url) + '</span>' +
+            '<span class="cu">' + escapeAttr(subset(e.url)) + '</span>' +
+          '</a>'
+        ).join('')
+      : '<div class="empty">no history yet</div>';
+    const bmHtml = bms.length
+      ? bms.map((e) =>
+          '<a class="card" href="' + escapeAttr(e.url) + '">' +
+            '<span class="ct">' + escapeAttr(e.title || e.url) + '</span>' +
+            '<span class="cu">' + escapeAttr(subset(e.url)) + '</span>' +
+          '</a>'
+        ).join('')
+      : '<div class="empty">no bookmarks yet</div>';
+
+    return '<!doctype html><html><head><style>' +
+      'html,body{margin:0;min-height:100%;background:#0b0d10;color:#e6e8eb;' +
+      'font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:64px 48px}' +
+      '.wrap{max-width:900px;margin:0 auto}' +
+      '.logo{font:300 44px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#e6e8eb;letter-spacing:6px;margin-bottom:8px}' +
+      '.sub{color:#5a636e;font:11px ui-monospace,monospace;letter-spacing:1px;margin-bottom:56px;text-transform:uppercase}' +
+      '.sec{margin-bottom:40px}' +
+      '.sec h3{color:#5a636e;font:11px ui-monospace,monospace;letter-spacing:1px;text-transform:uppercase;margin:0 0 14px;font-weight:500}' +
+      '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}' +
+      '.card{display:flex;flex-direction:column;gap:4px;padding:12px 14px;' +
+      'background:#0f1216;border:1px solid #171a1f;border-radius:10px;' +
+      'text-decoration:none;color:inherit;transition:border-color .12s,background .12s;overflow:hidden}' +
+      '.card:hover{border-color:#3b82f6;background:#14171c}' +
+      '.ct{color:#e6e8eb;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+      '.cu{color:#5a636e;font:10px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+      '.empty{color:#4b5563;font:11px ui-monospace,monospace;padding:12px 0}' +
+      '</style></head><body>' +
+      '<div class="wrap">' +
+        '<div class="logo">ghost</div>' +
+        '<div class="sub">cors-free browser · ' + (hasGM ? 'gm routed' : 'limited mode') + '</div>' +
+        (bms.length ? '<div class="sec"><h3>bookmarks</h3><div class="grid">' + bmHtml + '</div></div>' : '') +
+        '<div class="sec"><h3>recent</h3><div class="grid">' + recentHtml + '</div></div>' +
+      '</div>' +
+      '</body></html>';
+  }
+
+  function showNewTab(tab) {
+    tab.url = '';
+    tab.title = 'New Tab';
+    tab.iframe.srcdoc = newTabHtml();
+    tab.loaded = true;
+    renderTabStrip();
+    syncOmniboxToTab();
+    updateNavButtons();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 13. PARENT-SIDE BRIDGE (exposed to iframes via window.ghostBrowser)
+  // ══════════════════════════════════════════════════════════════════════════
+  const bridge = {
+    async fetch(url, method, headers, body) {
+      const start = Date.now();
+      const result = await ghostFetch(url, method, headers, body);
+      const ct = result.headers['Content-Type'] || result.headers['content-type'] || '';
+      logPush({
+        method: method || 'GET',
+        url,
+        status: result.status,
+        statusText: result.statusText,
+        duration: Date.now() - start,
+        bytes: result.buffer.byteLength,
+        contentType: ct,
+        crossOrigin: true,
+        reqHeaders: Object.assign({}, DEFAULT_REQ_HEADERS, headers || {}),
+        resHeaders: result.headers
+      });
+      return result;
+    },
+    navigate(url, background) {
+      if (background) { createTab(url, { background: true }); return; }
+      navigateActive(url);
+    },
+    historyPush(url) {
+      if (!activeTab) return;
+      if (activeTab.url === url) return;
+      activeTab.url = url;
+      if (activeTab.historyIdx < activeTab.history.length - 1) {
+        activeTab.history.splice(activeTab.historyIdx + 1);
+      }
+      activeTab.history.push(url);
+      activeTab.historyIdx = activeTab.history.length - 1;
+      syncOmniboxToTab();
+      updateNavButtons();
+    },
+    historyReplace(url) {
+      if (!activeTab) return;
+      activeTab.url = url;
+      if (activeTab.historyIdx >= 0) activeTab.history[activeTab.historyIdx] = url;
+      syncOmniboxToTab();
+    },
+    ready(url, title) {
+      if (!activeTab) return;
+      // Only update the tab whose iframe fired ready — find by matching url
+      const owner = tabs.find((t) => t.iframe && t.iframe.contentWindow === TOP.__ghostLastCaller);
+      if (owner) {
+        if (title) owner.title = String(title).slice(0, 200);
+      } else {
+        if (title && activeTab && activeTab.url === url) activeTab.title = String(title).slice(0, 200);
+      }
+      renderTabStrip();
+    }
+  };
+
+  // Expose to iframes
+  TOP.ghostBrowser = bridge;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 14. UI CONSTRUCTION
+  // ══════════════════════════════════════════════════════════════════════════
+  const ui = {
+    root: null,
+    tabstrip: null,
+    viewport: null,
+    omnibox: null,
+    back: null,
+    forward: null,
+    reload: null,
+    star: null,
+    resultsList: null,
+    results: null,
+    launcher: null,
+    status: null
+  };
+
+  function buildUI() {
+    // Root overlay
     const root = document.createElement('div');
-    root.id = 'ghost-hud-root';
+    root.id = 'ghost-browser-root';
     root.innerHTML = `
-      <div id="ghost-hud-toggle" title="Ghost (Ctrl+Shift+G)">G</div>
-      <div id="ghost-hud" hidden>
-        <div class="gh-head">
-          <span class="gh-dot"></span>
-          <span class="gh-title">ghost</span>
-          <span class="gh-spacer"></span>
-          <button class="gh-x" id="ghost-close">×</button>
+      <div class="gb-chrome">
+        <div class="gb-tabstrip" id="gb-tabstrip"></div>
+        <button class="gb-newtab" id="gb-newtab" title="New tab (Ctrl+T)">+</button>
+        <div class="gb-flex"></div>
+        <button class="gb-chrome-btn" id="gb-close" title="Exit Ghost (Esc)">×</button>
+      </div>
+      <div class="gb-navbar">
+        <button class="gb-nav" id="gb-back" title="Back (Alt+←)">‹</button>
+        <button class="gb-nav" id="gb-forward" title="Forward (Alt+→)">›</button>
+        <button class="gb-nav" id="gb-reload" title="Reload (Ctrl+R)">⟳</button>
+        <div class="gb-omnibox-wrap">
+          <input class="gb-omnibox" id="gb-omnibox" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="search or enter address — cors is off" />
+          <div class="gb-results" id="gb-results" hidden></div>
         </div>
-        <div class="gh-tabs">
-          <button class="gh-tab active" data-pane="requests">requests</button>
-          <button class="gh-tab" data-pane="rules">headers</button>
-          <button class="gh-tab" data-pane="body">body</button>
-          <button class="gh-tab" data-pane="settings">settings</button>
-        </div>
-        <div class="gh-pane active" data-pane="requests">
-          <div class="gh-bar">
-            <input id="ghost-filter" placeholder="filter url / status">
-            <button id="ghost-har" class="gh-btn">har</button>
-            <button id="ghost-clearlog" class="gh-btn">clear</button>
-          </div>
-          <div class="gh-stats" id="ghost-stats">0 requests</div>
-          <div class="gh-list" id="ghost-loglist"></div>
-        </div>
-        <div class="gh-pane" data-pane="rules">
-          <div class="gh-bar">
-            <button id="ghost-hr-new" class="gh-btn">new</button>
-            <button id="ghost-hr-reset" class="gh-btn">reset</button>
-          </div>
-          <div class="gh-list" id="ghost-hr-list"></div>
-        </div>
-        <div class="gh-pane" data-pane="body">
-          <div class="gh-bar">
-            <button id="ghost-br-new" class="gh-btn">new</button>
-            <button id="ghost-br-reset" class="gh-btn">reset</button>
-          </div>
-          <div class="gh-list" id="ghost-br-list"></div>
-        </div>
-        <div class="gh-pane" data-pane="settings">
-          <div class="gh-settings" id="ghost-settings"></div>
-        </div>
-        <div class="gh-detail" id="ghost-detail" hidden></div>
+        <button class="gb-nav" id="gb-star" title="Bookmark (Ctrl+D)">☆</button>
+        <button class="gb-nav" id="gb-menu" title="Menu">⋯</button>
+      </div>
+      <div class="gb-viewport" id="gb-viewport"></div>
+      <div class="gb-statusbar" id="gb-status"></div>
+      <div class="gb-menu-pop" id="gb-menu-pop" hidden>
+        <button data-act="har">export HAR</button>
+        <button data-act="clear-history">clear history</button>
+        <button data-act="clear-log">clear log</button>
+        <button data-act="reset">reset everything</button>
       </div>
     `;
-    document.documentElement.appendChild(root);
+    TOP.document.documentElement.appendChild(root);
 
     const style = document.createElement('style');
     style.textContent = `
-      #ghost-hud-root, #ghost-hud-root * {
+      #ghost-browser-root, #ghost-browser-root * {
         box-sizing: border-box;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 11px;
+        margin: 0; padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
-      #ghost-hud-toggle {
-        position: fixed; right: 12px; bottom: 12px;
-        width: 34px; height: 34px; border-radius: 10px;
-        background: rgba(15,18,22,.95); color: #e6e8eb;
-        border: 1px solid #1c2027; display: flex;
-        align-items: center; justify-content: center;
-        font-weight: 600; cursor: pointer; z-index: 2147483646;
-        box-shadow: 0 8px 24px rgba(0,0,0,.5);
-        user-select: none;
-      }
-      #ghost-hud-toggle:hover { background: #1c2027; color: #3b82f6; }
-      #ghost-hud {
-        position: fixed; right: 12px; bottom: 56px;
-        width: 480px; max-width: calc(100vw - 24px);
-        height: 520px; max-height: calc(100vh - 96px);
-        background: rgba(11,13,16,.98); color: #e6e8eb;
-        border: 1px solid #1c2027; border-radius: 12px;
-        display: flex; flex-direction: column; overflow: hidden;
+      #ghost-browser-root {
+        position: fixed; inset: 0;
+        background: #0b0d10; color: #e6e8eb;
         z-index: 2147483647;
-        box-shadow: 0 24px 60px rgba(0,0,0,.7);
-        backdrop-filter: blur(12px);
-      }
-      #ghost-hud[hidden] { display: none; }
-      #ghost-hud .gh-head {
-        display: flex; align-items: center; gap: 8px;
-        padding: 8px 12px; border-bottom: 1px solid #171a1f;
-        background: #0f1216;
-      }
-      #ghost-hud .gh-dot {
-        width: 8px; height: 8px; border-radius: 50%;
-        background: #10b981; box-shadow: 0 0 8px #10b981;
-      }
-      #ghost-hud .gh-title { color: #e6e8eb; font-weight: 600; letter-spacing: .5px; }
-      #ghost-hud .gh-spacer { flex: 1; }
-      #ghost-hud .gh-x {
-        background: transparent; border: none; color: #5a636e;
-        font-size: 18px; cursor: pointer; padding: 0 4px; border-radius: 4px;
-      }
-      #ghost-hud .gh-x:hover { background: #1c2027; color: #e6e8eb; }
-      #ghost-hud .gh-tabs {
-        display: flex; gap: 2px; padding: 6px 8px 0;
-        border-bottom: 1px solid #171a1f;
-      }
-      #ghost-hud .gh-tab {
-        background: transparent; border: none; color: #5a636e;
-        padding: 6px 12px; border-radius: 6px 6px 0 0;
-        cursor: pointer; font: inherit;
-      }
-      #ghost-hud .gh-tab.active { background: #14171c; color: #e6e8eb; }
-      #ghost-hud .gh-tab:hover:not(.active) { color: #9aa3ad; }
-      #ghost-hud .gh-pane {
-        display: none; flex: 1; min-height: 0;
-        flex-direction: column;
-      }
-      #ghost-hud .gh-pane.active { display: flex; }
-      #ghost-hud .gh-bar {
-        display: flex; gap: 6px; padding: 8px;
-        border-bottom: 1px solid #171a1f;
-      }
-      #ghost-hud input {
-        flex: 1; background: #14171c; border: 1px solid #1c2027;
-        border-radius: 6px; padding: 0 10px; height: 26px;
-        color: #e6e8eb; font: inherit; outline: none; min-width: 0;
-      }
-      #ghost-hud input:focus { border-color: #3b82f6; }
-      #ghost-hud .gh-btn {
-        background: #14171c; color: #9aa3ad;
-        border: 1px solid #1c2027; border-radius: 6px;
-        padding: 0 12px; height: 26px; cursor: pointer; font: inherit;
-      }
-      #ghost-hud .gh-btn:hover { background: #1c2027; color: #e6e8eb; }
-      #ghost-hud .gh-stats {
-        padding: 6px 12px; color: #5a636e;
-        border-bottom: 1px solid #171a1f;
-      }
-      #ghost-hud .gh-list {
-        flex: 1; overflow-y: auto; min-height: 0;
-      }
-      #ghost-hud .gh-list::-webkit-scrollbar { width: 8px; }
-      #ghost-hud .gh-list::-webkit-scrollbar-thumb {
-        background: #1c2027; border-radius: 4px;
-      }
-      #ghost-hud .gh-row {
-        display: grid; grid-template-columns: 42px 40px 1fr;
-        gap: 8px; padding: 4px 10px;
-        border-bottom: 1px solid #101318;
-        cursor: pointer; color: #9aa3ad; white-space: nowrap;
-      }
-      #ghost-hud .gh-row:hover { background: #101318; color: #e6e8eb; }
-      #ghost-hud .gh-row .m { color: #5a636e; }
-      #ghost-hud .gh-row .u { overflow: hidden; text-overflow: ellipsis; }
-      #ghost-hud .gh-row.s2 .s { color: #10b981; }
-      #ghost-hud .gh-row.s3 .s { color: #eab308; }
-      #ghost-hud .gh-row.s4 .s { color: #f59e0b; }
-      #ghost-hud .gh-row.s5 .s { color: #ef4444; }
-      #ghost-hud .gh-row.s0 .s { color: #4b5563; }
-      #ghost-hud .gh-rule {
-        background: #0f1216; border: 1px solid #171a1f;
-        border-radius: 8px; padding: 10px; margin: 8px;
-      }
-      #ghost-hud .gh-rule.dis { opacity: .5; }
-      #ghost-hud .gh-rule .rh {
-        display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
-      }
-      #ghost-hud .gh-rule .rid {
-        flex: 1; background: transparent; border: none;
-        color: #5a636e; font: inherit; outline: none;
-      }
-      #ghost-hud .gh-rule .rdel {
-        background: transparent; border: none; color: #5a636e;
-        font-size: 16px; cursor: pointer; padding: 0 6px; border-radius: 4px;
-      }
-      #ghost-hud .gh-rule .rdel:hover { background: #1c2027; color: #ef4444; }
-      #ghost-hud .gh-rule label {
-        display: flex; flex-direction: column; gap: 3px;
-        color: #5a636e; font-size: 10px; text-transform: uppercase;
-        letter-spacing: .5px; margin-bottom: 6px;
-      }
-      #ghost-hud .gh-rule input,
-      #ghost-hud .gh-rule select,
-      #ghost-hud .gh-rule textarea {
-        background: #14171c; border: 1px solid #1c2027;
-        border-radius: 5px; padding: 5px 8px;
-        color: #e6e8eb; font: inherit; outline: none;
-        width: 100%; resize: vertical;
-      }
-      #ghost-hud .gh-rule input:focus,
-      #ghost-hud .gh-rule textarea:focus { border-color: #3b82f6; }
-      #ghost-hud .gh-settings {
-        padding: 12px; display: flex; flex-direction: column; gap: 10px;
-      }
-      #ghost-hud .gh-setting {
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 8px 10px; background: #0f1216;
-        border: 1px solid #171a1f; border-radius: 8px;
-      }
-      #ghost-hud .gh-setting span { color: #9aa3ad; }
-      #ghost-hud .gh-setting input[type=checkbox] {
-        width: auto; flex: 0 0 auto; accent-color: #3b82f6;
-      }
-      #ghost-hud .gh-detail {
-        position: absolute; inset: 0;
-        background: rgba(11,13,16,.98);
         display: flex; flex-direction: column;
         overflow: hidden;
       }
-      #ghost-hud .gh-detail[hidden] { display: none; }
-      #ghost-hud .gh-detail .dh {
-        display: flex; align-items: center; gap: 10px;
-        padding: 10px 12px; border-bottom: 1px solid #171a1f;
-        background: #0f1216;
-      }
-      #ghost-hud .gh-detail .durl {
-        padding: 8px 12px; color: #9aa3ad;
+      .gb-chrome {
+        display: flex; align-items: flex-end;
+        height: 38px; padding: 0 8px; gap: 2px;
+        background: #0b0d10;
         border-bottom: 1px solid #171a1f;
-        word-break: break-all; background: #0f1216;
+        flex: 0 0 auto;
       }
-      #ghost-hud .gh-detail pre {
-        margin: 0; padding: 10px 12px;
-        color: #9aa3ad; white-space: pre-wrap;
-        word-break: break-all; overflow-y: auto;
-        background: #101318; border-radius: 6px;
-        margin: 8px 12px;
+      .gb-tabstrip { display: flex; gap: 2px; max-width: 70%; overflow-x: auto; scrollbar-width: none; }
+      .gb-tabstrip::-webkit-scrollbar { display: none; }
+      .gb-tab {
+        display: flex; align-items: center; gap: 8px;
+        min-width: 150px; max-width: 220px;
+        height: 32px; padding: 0 12px;
+        background: #14171c;
+        border-radius: 8px 8px 0 0;
+        font-size: 12px; color: #9aa3ad;
+        cursor: pointer; user-select: none;
+        white-space: nowrap; overflow: hidden;
       }
-      #ghost-hud .gh-detail .dlabel {
-        padding: 8px 12px 0; color: #5a636e;
-        text-transform: uppercase; letter-spacing: .5px;
-        font-size: 10px;
+      .gb-tab.active { background: #1c2027; color: #e6e8eb; }
+      .gb-tab .gb-title { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+      .gb-tab .gb-x {
+        opacity: 0.5; padding: 0 4px; border-radius: 4px;
       }
+      .gb-tab .gb-x:hover { opacity: 1; background: #2a2f38; }
+      .gb-newtab {
+        width: 32px; height: 32px;
+        background: #14171c; color: #9aa3ad;
+        border: none; border-radius: 8px 8px 0 0;
+        font-size: 18px; cursor: pointer;
+        margin-left: 2px;
+      }
+      .gb-newtab:hover { background: #1c2027; color: #e6e8eb; }
+      .gb-flex { flex: 1; }
+      .gb-chrome-btn {
+        width: 30px; height: 30px;
+        background: transparent; border: none;
+        color: #5a636e; font-size: 20px;
+        cursor: pointer; border-radius: 6px;
+        align-self: center;
+      }
+      .gb-chrome-btn:hover { background: #1c2027; color: #ef4444; }
+      .gb-navbar {
+        display: flex; align-items: center; gap: 4px;
+        height: 44px; padding: 0 10px;
+        background: #0f1216;
+        border-bottom: 1px solid #171a1f;
+        flex: 0 0 auto;
+        position: relative;
+      }
+      .gb-nav {
+        width: 32px; height: 32px;
+        background: transparent; border: none;
+        color: #9aa3ad; font-size: 16px;
+        cursor: pointer; border-radius: 6px;
+        flex: 0 0 auto;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .gb-nav:hover:not(:disabled) { background: #1c2027; color: #e6e8eb; }
+      .gb-nav:disabled { opacity: 0.3; cursor: default; }
+      #gb-star.active { color: #eab308; }
+      .gb-omnibox-wrap {
+        flex: 1; position: relative;
+        display: flex; align-items: center;
+      }
+      .gb-omnibox {
+        width: 100%; height: 32px;
+        background: #14171c;
+        border: 1px solid #1c2027;
+        border-radius: 8px;
+        padding: 0 14px;
+        color: #e6e8eb;
+        font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+        outline: none;
+      }
+      .gb-omnibox:focus { border-color: #3b82f6; background: #171a1f; }
+      .gb-results {
+        position: absolute; top: 36px; left: 0; right: 0;
+        background: #0f1216;
+        border: 1px solid #1c2027;
+        border-radius: 10px;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.7);
+        z-index: 10;
+        overflow: hidden;
+        max-height: 420px;
+        overflow-y: auto;
+      }
+      .gb-result {
+        display: flex; flex-direction: column;
+        padding: 8px 14px;
+        cursor: pointer;
+        border-bottom: 1px solid #101318;
+      }
+      .gb-result:last-child { border-bottom: none; }
+      .gb-result.active { background: #14171c; }
+      .gb-result .rt {
+        font-size: 13px; color: #e6e8eb;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .gb-result .rs {
+        font: 10px ui-monospace, monospace;
+        color: #5a636e;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        margin-top: 2px;
+      }
+      .gb-result .rb {
+        display: inline-block;
+        font-size: 9px; text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 1px 5px; margin-right: 6px;
+        border-radius: 3px;
+        background: #1c2027; color: #9aa3ad;
+        vertical-align: middle;
+      }
+      .gb-result .rb.bm { background: #1e3a2a; color: #6ee7b7; }
+      .gb-result .rb.url { background: #1e293b; color: #60a5fa; }
+      .gb-result .rb.search { background: #3b2a1e; color: #fbbf24; }
+      .gb-viewport {
+        flex: 1; position: relative;
+        background: #ffffff;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .gb-frame {
+        width: 100%; height: 100%;
+        border: none;
+        background: #ffffff;
+        position: absolute; inset: 0;
+      }
+      .gb-statusbar {
+        height: 22px;
+        background: #0b0d10;
+        border-top: 1px solid #171a1f;
+        display: flex; align-items: center;
+        padding: 0 12px;
+        font: 10px ui-monospace, monospace;
+        color: #5a636e;
+        flex: 0 0 auto;
+        gap: 16px;
+        overflow: hidden;
+      }
+      .gb-menu-pop {
+        position: absolute; top: 82px; right: 12px;
+        background: #0f1216;
+        border: 1px solid #1c2027;
+        border-radius: 10px;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.7);
+        z-index: 20;
+        overflow: hidden;
+        min-width: 200px;
+      }
+      .gb-menu-pop button {
+        display: block; width: 100%;
+        background: transparent; border: none;
+        color: #9aa3ad;
+        text-align: left;
+        padding: 10px 16px;
+        font: 12px ui-monospace, monospace;
+        cursor: pointer;
+      }
+      .gb-menu-pop button:hover { background: #14171c; color: #e6e8eb; }
     `;
-    document.documentElement.appendChild(style);
+    TOP.document.documentElement.appendChild(style);
 
-    // ── wiring ──
-    const toggle = root.querySelector('#ghost-hud-toggle');
-    const hud = root.querySelector('#ghost-hud');
-    const closeBtn = root.querySelector('#ghost-close');
-    const filterEl = root.querySelector('#ghost-filter');
-    const logList = root.querySelector('#ghost-loglist');
-    const statsEl = root.querySelector('#ghost-stats');
-    const detail = root.querySelector('#ghost-detail');
-    const hrList = root.querySelector('#ghost-hr-list');
-    const brList = root.querySelector('#ghost-br-list');
-    const settingsPane = root.querySelector('#ghost-settings');
+    ui.root = root;
+    ui.tabstrip = root.querySelector('#gb-tabstrip');
+    ui.viewport = root.querySelector('#gb-viewport');
+    ui.omnibox = root.querySelector('#gb-omnibox');
+    ui.back = root.querySelector('#gb-back');
+    ui.forward = root.querySelector('#gb-forward');
+    ui.reload = root.querySelector('#gb-reload');
+    ui.star = root.querySelector('#gb-star');
+    ui.resultsList = root.querySelector('#gb-results');
+    ui.status = root.querySelector('#gb-status');
 
-    function openHUD() {
-      hud.hidden = false;
-      settings.hudVisible = true;
-      saveSettings();
-      renderLog();
-    }
-    function closeHUD() {
-      hud.hidden = true;
-      settings.hudVisible = false;
-      saveSettings();
-      detail.hidden = true;
-    }
-    function toggleHUD() { hud.hidden ? openHUD() : closeHUD(); }
+    // ── wire nav buttons ──
+    ui.back.addEventListener('click', back);
+    ui.forward.addEventListener('click', forward);
+    ui.reload.addEventListener('click', reloadActive);
+    root.querySelector('#gb-newtab').addEventListener('click', () => createTab());
+    root.querySelector('#gb-close').addEventListener('click', hideBrowser);
+    ui.star.addEventListener('click', toggleBookmarkActive);
 
-    toggle.addEventListener('click', toggleHUD);
-    closeBtn.addEventListener('click', closeHUD);
+    const menuBtn = root.querySelector('#gb-menu');
+    const menuPop = root.querySelector('#gb-menu-pop');
+    menuBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      menuPop.hidden = !menuPop.hidden;
+    });
+    document.addEventListener('click', (e) => {
+      if (!menuPop.hidden && !menuPop.contains(e.target) && e.target !== menuBtn) {
+        menuPop.hidden = true;
+      }
+    });
+    menuPop.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      menuPop.hidden = true;
+      const act = btn.dataset.act;
+      if (act === 'har') exportHAR();
+      if (act === 'clear-history') { historyClear(); invalidateIndex(); flashStatus('history cleared'); }
+      if (act === 'clear-log') { logClear(); flashStatus('log cleared'); }
+      if (act === 'reset') resetEverything();
+    });
+
+    // ── omnibox behavior ──
+    ui.omnibox.addEventListener('focus', () => {
+      ui.omnibox.select();
+    });
+
+    ui.omnibox.addEventListener('input', () => {
+      const q = ui.omnibox.value;
+      const results = search(q, 9);
+      renderResults(results);
+    });
+
+    ui.omnibox.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const active = ui.resultsList.querySelector('.gb-result.active');
+        if (active && active.dataset.url) {
+          navigateActive(active.dataset.url);
+        } else {
+          const q = ui.omnibox.value.trim();
+          if (!q) return;
+          const results = search(q, 9);
+          if (results.length) navigateActive(results[0].url);
+        }
+        closeResults();
+        ui.omnibox.blur();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeResults();
+        syncOmniboxToTab();
+        ui.omnibox.blur();
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveResultSelection(e.key === 'ArrowDown' ? 1 : -1);
+      }
+    });
 
     document.addEventListener('keydown', (e) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === 'G' || e.key === 'g')) {
+      handleGlobalKey(e);
+    }, true);
+  }
+
+  function renderTabStrip() {
+    if (!ui.tabstrip) return;
+    ui.tabstrip.innerHTML = '';
+    for (const t of tabs) {
+      const el = document.createElement('div');
+      el.className = 'gb-tab' + (t === activeTab ? ' active' : '');
+      el.innerHTML =
+        '<span class="gb-title">' + escapeHtml(t.title || 'New Tab') + '</span>' +
+        '<span class="gb-x">×</span>';
+      el.addEventListener('click', (e) => {
+        if (e.target.classList.contains('gb-x')) {
+          e.stopPropagation();
+          closeTab(t.id);
+        } else {
+          setActiveTab(t);
+        }
+      });
+      el.addEventListener('auxclick', (e) => {
+        if (e.button === 1) {
+          e.preventDefault();
+          closeTab(t.id);
+        }
+      });
+      ui.tabstrip.appendChild(el);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderResults(results) {
+    if (!results || !results.length) {
+      closeResults();
+      return;
+    }
+    ui.resultsList.innerHTML = '';
+    ui.resultsList.hidden = false;
+
+    results.forEach((r, i) => {
+      const el = document.createElement('div');
+      el.className = 'gb-result' + (i === 0 ? ' active' : '');
+      el.dataset.url = r.url;
+      const badgeClass = r.type === 'bookmark' ? 'bm' : (r.type === 'url' ? 'url' : (r.type === 'search' ? 'search' : ''));
+      const badge = r.type === 'bookmark' ? 'bookmark' :
+                    r.type === 'url' ? 'url' :
+                    r.type === 'search' ? 'search' : '';
+      el.innerHTML =
+        '<div class="rt">' +
+          (badge ? '<span class="rb ' + badgeClass + '">' + badge + '</span>' : '') +
+          escapeHtml(r.title || r.url) +
+        '</div>' +
+        '<div class="rs">' + escapeHtml(r.subtitle || r.url) + '</div>';
+
+      el.addEventListener('mouseenter', () => {
+        const all = ui.resultsList.querySelectorAll('.gb-result');
+        all.forEach((x) => x.classList.remove('active'));
+        el.classList.add('active');
+      });
+      el.addEventListener('mousedown', (e) => {
         e.preventDefault();
-        toggleHUD();
+        navigateActive(r.url);
+        closeResults();
+        ui.omnibox.blur();
+      });
+      ui.resultsList.appendChild(el);
+    });
+  }
+
+  function moveResultSelection(delta) {
+    const all = [...ui.resultsList.querySelectorAll('.gb-result')];
+    if (!all.length) return;
+    const currentIdx = all.findIndex((el) => el.classList.contains('active'));
+    let nextIdx = (currentIdx < 0 ? 0 : currentIdx + delta);
+    if (nextIdx < 0) nextIdx = all.length - 1;
+    if (nextIdx >= all.length) nextIdx = 0;
+    all.forEach((x) => x.classList.remove('active'));
+    all[nextIdx].classList.add('active');
+    all[nextIdx].scrollIntoView({ block: 'nearest' });
+  }
+
+  function closeResults() {
+    if (ui.resultsList) {
+      ui.resultsList.hidden = true;
+      ui.resultsList.innerHTML = '';
+    }
+  }
+
+  function focusOmnibox(selectAll) {
+    if (!ui.omnibox) return;
+    ui.omnibox.focus();
+    if (selectAll) ui.omnibox.select();
+  }
+
+  function toggleBookmarkActive() {
+    if (!activeTab || !activeTab.url) return;
+    const added = bmToggle(activeTab.url, activeTab.title);
+    invalidateIndex();
+    flashStatus(added ? 'bookmarked' : 'bookmark removed');
+    updateStarState();
+  }
+
+  function updateStarState() {
+    if (!ui.star) return;
+    const active = activeTab && activeTab.url && bmHas(activeTab.url);
+    ui.star.classList.toggle('active', !!active);
+    ui.star.textContent = active ? '★' : '☆';
+  }
+
+  function flashStatus(msg) {
+    if (!ui.status) return;
+    ui.status.innerHTML = '<span>' + escapeHtml(msg) + '</span>';
+    setTimeout(() => updateStatusbar(), 1600);
+  }
+
+  function updateStatusbar() {
+    if (!ui.status) return;
+    const idx = searchIndex || buildIndex();
+    ui.status.innerHTML =
+      '<span>' + tabs.length + ' tab' + (tabs.length === 1 ? '' : 's') + '</span>' +
+      '<span>' + logRing.length + ' requests</span>' +
+      '<span>' + idx.length + ' indexed</span>' +
+      '<span>' + (hasGM ? 'gm routed' : 'local mode') + '</span>' +
+      '<span>engine: ' + settings.engine + '</span>';
+  }
+
+  function handleGlobalKey(e) {
+    const mod = e.ctrlKey || e.metaKey;
+    const key = e.key;
+
+    // Esc — exit browser overlay
+    if (key === 'Escape') {
+      // If results open, close them first
+      if (ui.resultsList && !ui.resultsList.hidden) return;
+      if (document.activeElement === ui.omnibox) return;
+      e.preventDefault();
+      hideBrowser();
+      return;
+    }
+
+    if (mod && !e.shiftKey && key === 't') {
+      e.preventDefault();
+      createTab();
+      return;
+    }
+    if (mod && !e.shiftKey && key === 'w') {
+      e.preventDefault();
+      if (activeTab) closeTab(activeTab.id);
+      return;
+    }
+    if (mod && !e.shiftKey && key === 'l') {
+      e.preventDefault();
+      focusOmnibox(true);
+      return;
+    }
+    if (mod && !e.shiftKey && key === 'r') {
+      e.preventDefault();
+      reloadActive();
+      return;
+    }
+    if (mod && e.shiftKey && (key === 'R' || key === 'r')) {
+      e.preventDefault();
+      if (activeTab && activeTab.url) navigateTab(activeTab, activeTab.url, { noHistory: true });
+      return;
+    }
+    if (mod && !e.shiftKey && key === 'd') {
+      e.preventDefault();
+      toggleBookmarkActive();
+      return;
+    }
+    if (mod && !e.shiftKey && (key === 'h' || key === 'H')) {
+      e.preventDefault();
+      exportHAR();
+      return;
+    }
+    if (mod && key === 'Tab') {
+      e.preventDefault();
+      if (tabs.length < 2) return;
+      const i = tabs.indexOf(activeTab);
+      const next = tabs[(i + (e.shiftKey ? -1 : 1) + tabs.length) % tabs.length];
+      setActiveTab(next);
+      return;
+    }
+    if (key === 'F5') {
+      e.preventDefault();
+      reloadActive();
+      return;
+    }
+    if (e.altKey && key === 'ArrowLeft') {
+      e.preventDefault();
+      back();
+      return;
+    }
+    if (e.altKey && key === 'ArrowRight') {
+      e.preventDefault();
+      forward();
+      return;
+    }
+    if (mod && !e.shiftKey && key >= '1' && key <= '9') {
+      const idx = parseInt(key, 10) - 1;
+      if (tabs[idx]) {
+        e.preventDefault();
+        setActiveTab(tabs[idx]);
+      }
+      return;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 15. LIFECYCLE
+  // ══════════════════════════════════════════════════════════════════════════
+  let isOpen = false;
+
+  function showBrowser(opts) {
+    opts = opts || {};
+    if (!ui.root) buildUI();
+    ui.root.style.display = 'flex';
+    isOpen = true;
+    document.documentElement.style.overflow = 'hidden';
+
+    // Kick off perf counters
+    updateStatusbar();
+    const statusTimer = setInterval(updateStatusbar, 2000);
+    TOP.__ghostStatusTimer = statusTimer;
+
+    if (tabs.length === 0) {
+      createTab(opts.url);
+    } else if (opts.url) {
+      navigateActive(opts.url);
+    }
+
+    // Focus omnibox if opening with no URL
+    if (!opts.url) {
+      setTimeout(() => focusOmnibox(true), 30);
+    }
+  }
+
+  function hideBrowser() {
+    if (!ui.root) return;
+    ui.root.style.display = 'none';
+    isOpen = false;
+    document.documentElement.style.overflow = '';
+    if (TOP.__ghostStatusTimer) {
+      clearInterval(TOP.__ghostStatusTimer);
+      TOP.__ghostStatusTimer = null;
+    }
+  }
+
+  function toggleBrowser() {
+    if (isOpen) hideBrowser();
+    else showBrowser();
+  }
+
+  // reset everything to defaults
+  function resetEverything() {
+    const keys = store.keys();
+    for (const k of keys) {
+      if (String(k).startsWith('ghost:') || k === 'settings' || k === 'history' || k === 'bookmarks' || k === 'body rules' || k === 'header rules') {
+        store.del(k);
+      }
+    }
+    historyCache = null;
+    bookmarkCache = null;
+    invalidateIndex();
+    settings = Object.assign({}, SETTINGS_DEFAULTS);
+    saveSettings();
+    flashStatus('reset — reload the page');
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 16. MENU COMMANDS + LAUNCHER
+  // ══════════════════════════════════════════════════════════════════════════
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    try {
+      GM_registerMenuCommand('Open Ghost Browser (Ctrl+Shift+B)', () => showBrowser());
+      GM_registerMenuCommand('Toggle Ghost Browser', () => toggleBrowser());
+      GM_registerMenuCommand('Export HAR', () => exportHAR());
+      GM_registerMenuCommand('Clear History', () => { historyClear(); invalidateIndex(); });
+      GM_registerMenuCommand('Clear Request Log', () => logClear());
+    } catch (e) {}
+  }
+
+  function buildLauncher() {
+    if (!settings.showLauncher) return;
+    if (document.getElementById('ghost-launcher')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'ghost-launcher';
+    btn.title = 'Open Ghost Browser (Ctrl+Shift+B)';
+    btn.textContent = 'G';
+    btn.addEventListener('click', () => showBrowser());
+
+    const s = document.createElement('style');
+    s.textContent = `
+      #ghost-launcher {
+        position: fixed; right: 14px; bottom: 14px;
+        width: 38px; height: 38px;
+        border-radius: 12px;
+        background: rgba(15,18,22,0.96);
+        color: #e6e8eb;
+        border: 1px solid #1c2027;
+        font: 600 15px -apple-system, BlinkMacSystemFont, sans-serif;
+        cursor: pointer;
+        z-index: 2147483646;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+        transition: transform 0.1s, background 0.1s, color 0.1s;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #ghost-launcher:hover {
+        background: #1c2027; color: #3b82f6;
+        transform: scale(1.05);
+      }
+      #ghost-launcher:active { transform: scale(0.97); }
+    `;
+    TOP.document.documentElement.appendChild(s);
+    TOP.document.documentElement.appendChild(btn);
+
+    // keyboard: ctrl+shift+b
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'B' || e.key === 'b')) {
+        e.preventDefault();
+        toggleBrowser();
       }
     }, true);
-
-    // pane switching
-    const tabsEls = root.querySelectorAll('.gh-tab');
-    const panes = root.querySelectorAll('.gh-pane');
-    tabsEls.forEach((t) => {
-      t.addEventListener('click', () => {
-        tabsEls.forEach((x) => x.classList.remove('active'));
-        panes.forEach((x) => x.classList.remove('active'));
-        t.classList.add('active');
-        const pane = root.querySelector('.gh-pane[data-pane="' + t.dataset.pane + '"]');
-        if (pane) pane.classList.add('active');
-      });
-    });
-
-    // ── request log render ──
-    let filter = '';
-    let cachedLog = [];
-
-    function statusClass(code) {
-      if (code >= 500) return 's5';
-      if (code >= 400) return 's4';
-      if (code >= 300) return 's3';
-      if (code >= 200) return 's2';
-      return 's0';
-    }
-
-    function renderLog() {
-      const f = filter.toLowerCase();
-      const visible = cachedLog.filter((r) => {
-        if (!f) return true;
-        return (r.url || '').toLowerCase().includes(f) ||
-               String(r.status || '').includes(f) ||
-               (r.method || '').toLowerCase().includes(f);
-      });
-
-      logList.innerHTML = '';
-      const frag = document.createDocumentFragment();
-      for (const r of visible.slice(-400)) {
-        const el = document.createElement('div');
-        el.className = 'gh-row ' + statusClass(r.status);
-        el.dataset.id = r.id;
-        el.innerHTML =
-          '<span class="m">' + (r.method || 'GET') + '</span>' +
-          '<span class="s">' + (r.status || '···') + '</span>' +
-          '<span class="u" title="' + r.url + '">' + shortUrl(r.url) + '</span>';
-        el.addEventListener('click', () => showDetail(r));
-        frag.appendChild(el);
-      }
-      logList.appendChild(frag);
-      logList.scrollTop = logList.scrollHeight;
-
-      const s = cachedLog.reduce((a, r) => {
-        a.total++;
-        if (r.status >= 400) a.err++;
-        if (r.blocked) a.blocked++;
-        return a;
-      }, { total: 0, err: 0, blocked: 0 });
-      statsEl.textContent = s.total + ' total · ' + s.err + ' errors · ' + s.blocked + ' blocked';
-    }
-
-    function showDetail(rec) {
-      const fmt = (o) => {
-        if (!o) return '(none)';
-        return Object.entries(o).map(([k, v]) => k + ': ' + v).join('\n');
-      };
-      detail.innerHTML =
-        '<div class="dh">' +
-          '<span class="m" style="color:#3b82f6">' + (rec.method || 'GET') + '</span>' +
-          '<span class="s" style="color:#10b981">' + (rec.status || '···') + '</span>' +
-          '<span class="gh-spacer" style="flex:1"></span>' +
-          '<button class="gh-btn" id="ghost-det-close">close</button>' +
-        '</div>' +
-        '<div class="durl">' + (rec.url || '') + '</div>' +
-        '<div class="dlabel">request headers</div>' +
-        '<pre>' + fmt(rec.reqHeaders) + '</pre>' +
-        '<div class="dlabel">response headers</div>' +
-        '<pre>' + fmt(rec.resHeaders) + '</pre>' +
-        '<div class="dlabel">meta</div>' +
-        '<pre>' +
-          'duration:    ' + (rec.duration || 0) + 'ms\n' +
-          'bytes:       ' + (rec.bytes || 0) + '\n' +
-          'content-type:' + (rec.contentType || '—') + '\n' +
-          'cross-origin:' + (rec.crossOrigin ? 'yes' : 'no') + '\n' +
-          'blocked:     ' + (rec.blocked ? 'yes' : 'no') + '\n' +
-          'time:        ' + new Date(rec.ts).toLocaleTimeString() +
-        '</pre>';
-      detail.hidden = false;
-      detail.querySelector('#ghost-det-close').addEventListener('click', () => { detail.hidden = true; });
-    }
-
-    filterEl.addEventListener('input', () => { filter = filterEl.value; renderLog(); });
-
-    root.querySelector('#ghost-clearlog').addEventListener('click', () => {
-      logStore.clear();
-      cachedLog = [];
-      renderLog();
-    });
-
-    root.querySelector('#ghost-har').addEventListener('click', exportHAR);
-
-    // live log stream
-    logStore.subscribe((rec) => {
-      if (rec && rec.__clear) { cachedLog = []; renderLog(); return; }
-      cachedLog.push(rec);
-      if (cachedLog.length > MAX_LOG) cachedLog.shift();
-      if (!hud.hidden) renderLog();
-    });
-
-    cachedLog = logStore.all();
-    renderLog();
-
-    // ── header rules pane ──
-    function renderHeaderRules() {
-      hrList.innerHTML = '';
-      for (const r of headerRules) {
-        const el = document.createElement('div');
-        el.className = 'gh-rule' + (r.enabled ? '' : ' dis');
-        el.dataset.id = r.id;
-        el.innerHTML =
-          '<div class="rh">' +
-            '<input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-act="toggle" style="width:auto;flex:0 0 auto">' +
-            '<input class="rid" value="' + r.id + '" readonly>' +
-            '<button class="rdel" title="delete">×</button>' +
-          '</div>' +
-          '<label>match<input class="r-match" value="' + String(r.match || '').replace(/"/g, '&quot;') + '"></label>' +
-          '<label>phase<select class="r-phase">' +
-            '<option value="request"' + (r.phase === 'request' ? ' selected' : '') + '>request</option>' +
-            '<option value="response"' + (r.phase === 'response' ? ' selected' : '') + '>response</option>' +
-            '<option value="both"' + (r.phase === 'both' ? ' selected' : '') + '>both</option>' +
-          '</select></label>' +
-          '<label>set (json)<textarea class="r-set" rows="2">' + JSON.stringify(r.set || {}) + '</textarea></label>' +
-          '<label>remove (comma list)<input class="r-remove" value="' + (r.remove || []).join(', ') + '"></label>';
-
-        el.querySelector('[data-act="toggle"]').addEventListener('change', (e) => {
-          updateHeaderRule(r.id, { enabled: e.target.checked });
-          el.classList.toggle('dis', !e.target.checked);
-        });
-        el.querySelector('.rdel').addEventListener('click', () => {
-          removeHeaderRule(r.id);
-          renderHeaderRules();
-        });
-
-        const commit = () => {
-          let setObj = {};
-          try { setObj = JSON.parse(el.querySelector('.r-set').value || '{}'); } catch (e) {}
-          const removeArr = el.querySelector('.r-remove').value.split(',').map((s) => s.trim()).filter(Boolean);
-          updateHeaderRule(r.id, {
-            match: el.querySelector('.r-match').value,
-            phase: el.querySelector('.r-phase').value,
-            set: setObj,
-            remove: removeArr
-          });
-        };
-        el.querySelector('.r-match').addEventListener('blur', commit);
-        el.querySelector('.r-phase').addEventListener('change', commit);
-        el.querySelector('.r-set').addEventListener('blur', commit);
-        el.querySelector('.r-remove').addEventListener('blur', commit);
-
-        hrList.appendChild(el);
-      }
-    }
-
-    root.querySelector('#ghost-hr-new').addEventListener('click', () => {
-      addHeaderRule({ id: '', enabled: true, match: '.*', phase: 'both', set: {}, remove: [] });
-      renderHeaderRules();
-    });
-    root.querySelector('#ghost-hr-reset').addEventListener('click', () => {
-      resetHeaderRules();
-      renderHeaderRules();
-    });
-    renderHeaderRules();
-
-    // ── body rules pane ──
-    function renderBodyRules() {
-      brList.innerHTML = '';
-      for (const r of bodyRules) {
-        const el = document.createElement('div');
-        el.className = 'gh-rule' + (r.enabled ? '' : ' dis');
-        el.dataset.id = r.id;
-        el.innerHTML =
-          '<div class="rh">' +
-            '<input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-act="toggle" style="width:auto;flex:0 0 auto">' +
-            '<input class="rid" value="' + r.id + '" readonly>' +
-            '<button class="rdel" title="delete">×</button>' +
-          '</div>' +
-          '<label>match<input class="r-match" value="' + String(r.match || '').replace(/"/g, '&quot;') + '"></label>' +
-          '<label>content-type<input class="r-ct" value="' + String(r.contentType || '').replace(/"/g, '&quot;') + '"></label>' +
-          '<label>mode<select class="r-mode">' +
-            '<option value="json"' + (r.mode === 'json' ? ' selected' : '') + '>json</option>' +
-            '<option value="text"' + (r.mode === 'text' ? ' selected' : '') + '>text</option>' +
-          '</select></label>' +
-          '<label>order<input class="r-order" type="number" value="' + (r.order || 100) + '"></label>' +
-          '<label>transform — (data) =&gt; data<textarea class="r-xf" rows="4">' +
-            String(r.transform || '').replace(/</g, '&lt;') +
-          '</textarea></label>';
-
-        el.querySelector('[data-act="toggle"]').addEventListener('change', (e) => {
-          updateBodyRule(r.id, { enabled: e.target.checked });
-          el.classList.toggle('dis', !e.target.checked);
-        });
-        el.querySelector('.rdel').addEventListener('click', () => {
-          removeBodyRule(r.id);
-          renderBodyRules();
-        });
-
-        const commit = () => {
-          updateBodyRule(r.id, {
-            match: el.querySelector('.r-match').value,
-            contentType: el.querySelector('.r-ct').value,
-            mode: el.querySelector('.r-mode').value,
-            order: parseInt(el.querySelector('.r-order').value, 10) || 100,
-            transform: el.querySelector('.r-xf').value
-          });
-        };
-        el.querySelector('.r-match').addEventListener('blur', commit);
-        el.querySelector('.r-ct').addEventListener('blur', commit);
-        el.querySelector('.r-mode').addEventListener('change', commit);
-        el.querySelector('.r-order').addEventListener('blur', commit);
-        el.querySelector('.r-xf').addEventListener('blur', commit);
-
-        brList.appendChild(el);
-      }
-    }
-
-    root.querySelector('#ghost-br-new').addEventListener('click', () => {
-      addBodyRule({
-        id: '',
-        enabled: true,
-        match: '.*/api/.*',
-        contentType: 'application/json',
-        mode: 'json',
-        order: 100,
-        transform: 'return data;'
-      });
-      renderBodyRules();
-    });
-    root.querySelector('#ghost-br-reset').addEventListener('click', () => {
-      resetBodyRules();
-      renderBodyRules();
-    });
-    renderBodyRules();
-
-    // ── settings pane ──
-    function renderSettings() {
-      settingsPane.innerHTML = '';
-      const items = [
-        ['cspStrip', 'strip csp meta tags'],
-        ['frameBuster', 'neutralize frame-busters'],
-        ['patchFetch', 'patch window.fetch'],
-        ['patchXHR', 'patch XMLHttpRequest'],
-        ['verbose', 'verbose console logs']
-      ];
-      for (const [key, label] of items) {
-        const row = document.createElement('div');
-        row.className = 'gh-setting';
-        row.innerHTML = '<span>' + label + '</span>' +
-          '<input type="checkbox" ' + (settings[key] ? 'checked' : '') + '>';
-        row.querySelector('input').addEventListener('change', (e) => {
-          settings[key] = e.target.checked;
-          saveSettings();
-        });
-        settingsPane.appendChild(row);
-      }
-
-      const info = document.createElement('div');
-      info.className = 'gh-setting';
-      info.innerHTML = '<span>rules</span><span style="color:#e6e8eb">' +
-        headerRules.length + ' headers · ' + bodyRules.length + ' bodies</span>';
-      settingsPane.appendChild(info);
-
-      const wipe = document.createElement('div');
-      wipe.className = 'gh-setting';
-      wipe.innerHTML = '<span>reset everything</span>';
-      const btn = document.createElement('button');
-      btn.className = 'gh-btn';
-      btn.textContent = 'wipe';
-      btn.addEventListener('click', () => {
-        for (const k of gm.list()) {
-          if (String(k).startsWith('ghost:')) gm.del(k);
-        }
-        gm.notify('cleared. reload the page.', 'Ghost');
-      });
-      wipe.appendChild(btn);
-      settingsPane.appendChild(wipe);
-    }
-    renderSettings();
-
-    // initial visibility
-    if (settings.hudVisible) openHUD();
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 13. CONTEXT MENU COMMANDS
-  // ═══════════════════════════════════════════════════════════════════
-  function registerMenus() {
-    gm.menu('Ghost: toggle HUD (Ctrl+Shift+G)', () => {
-      const hud = document.getElementById('ghost-hud');
-      const toggle = document.getElementById('ghost-hud-toggle');
-      if (toggle) toggle.click();
-      else if (hud) hud.hidden = !hud.hidden;
-    });
-
-    gm.menu('Ghost: export HAR', () => {
-      exportHAR();
-    });
-
-    gm.menu('Ghost: clear request log', () => {
-      logStore.clear();
-    });
-
-    gm.menu('Ghost: reset header rules', () => {
-      resetHeaderRules();
-      gm.notify('header rules reset', 'Ghost');
-    });
-
-    gm.menu('Ghost: reset body rules', () => {
-      resetBodyRules();
-      gm.notify('body rules reset', 'Ghost');
-    });
+  // ══════════════════════════════════════════════════════════════════════════
+  // 17. AUTO-OPENER
+  // ══════════════════════════════════════════════════════════════════════════
+  function isBlankPage() {
+    try {
+      const u = location.href;
+      if (/^(about:blank|about:newtab|about:home|chrome:\/\/newtab)/i.test(u)) return true;
+      if (/^https?:\/\/(www\.)?(google\.com\/(_\/chrome\/newtab|webhp)|newtab|duckduckgo\.com\/\?)/i.test(u) && document.body && document.body.children.length < 3) return true;
+      if (document.body && document.body.children.length === 0 && !document.body.innerText.trim()) return true;
+    } catch (e) {}
+    return false;
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // 14. BOOT
-  // ═══════════════════════════════════════════════════════════════════
+  function maybeAutoOpen() {
+    if (!settings.autoOpenOnBlank) return;
+    if (!isBlankPage()) return;
+
+    // Wait a beat so document settles, then open
+    setTimeout(() => {
+      if (isBlankPage()) showBrowser();
+    }, 150);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 18. BOOT
+  // ══════════════════════════════════════════════════════════════════════════
   function boot() {
-    installCSPStripper();
-    installFrameBuster();
-    installFetchPatch();
-    installXHRPatch();
-    registerMenus();
+    registerMenuCommands();
 
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', mountHUD, { once: true });
+      document.addEventListener('DOMContentLoaded', () => {
+        buildLauncher();
+        maybeAutoOpen();
+      }, { once: true });
     } else {
-      mountHUD();
-    }
-
-    if (settings.verbose) {
-      console.log('[ghost] active — cors bypass on, csp strip on, ' +
-        headerRules.length + ' header rules, ' + bodyRules.length + ' body rules');
+      buildLauncher();
+      maybeAutoOpen();
     }
   }
 
-  boot();
-
-  // expose for debugging from the page console
+  // ── expose debug surface ──
   try {
-    PAGE.__ghost = {
-      log: logStore.all.bind(logStore),
-      clear: logStore.clear.bind(logStore),
-      headerRules: () => headerRules,
-      bodyRules: () => bodyRules,
-      settings: () => settings,
-      exportHAR
+    TOP.ghost = {
+      open: showBrowser,
+      close: hideBrowser,
+      toggle: toggleBrowser,
+      search: (q) => search(q, 9),
+      history: historyAll,
+      bookmarks: bmAll,
+      log: logAll,
+      exportHAR,
+      reset: resetEverything,
+      settings: () => Object.assign({}, settings),
+      setSetting: (k, v) => { settings[k] = v; saveSettings(); }
     };
   } catch (e) {}
+
+  boot();
 })();
