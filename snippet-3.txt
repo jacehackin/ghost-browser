@@ -1,0 +1,16 @@
+
+## 2. proxy.js — add the transform hook
+
+In `proxy.js`, add these lines below the requires:
+
+```js
+let bodyTransform = null;
+function setBodyTransform(fn) { bodyTransform = fn; }
+function collectBody(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}

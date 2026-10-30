@@ -1,0 +1,1 @@
+wireBrowserSidebar({ ipcMain, session, BrowserWindow, app, dialog });

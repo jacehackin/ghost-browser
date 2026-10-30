@@ -1,0 +1,1 @@
+const { wireBrowserSidebar } = require('./src/main-integration-v2');

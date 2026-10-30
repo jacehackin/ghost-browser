@@ -1,0 +1,42 @@
+<!-- renderer/sidebar.html -->
+<aside class="sidebar" id="sidebar" aria-hidden="true">
+  <header class="sb-head">
+    <div class="sb-tabs">
+      <button class="sb-tab active" data-pane="requests">requests</button>
+      <button class="sb-tab" data-pane="rules">rules</button>
+      <button class="sb-tab" data-pane="proxy">proxy</button>
+    </div>
+    <button class="sb-close" id="sb-close" title="Close panel">×</button>
+  </header>
+
+  <section class="sb-pane active" data-pane="requests">
+    <div class="sb-toolbar">
+      <input id="log-filter" class="sb-input" type="text" placeholder="filter url / status..." />
+      <button id="log-clear" class="sb-btn">clear</button>
+    </div>
+    <div id="log-stats" class="sb-stats">0 requests</div>
+    <div id="log-list" class="log-list"></div>
+  </section>
+
+  <section class="sb-pane" data-pane="rules">
+    <div class="sb-toolbar">
+      <button id="rules-new" class="sb-btn">new rule</button>
+      <button id="rules-reset" class="sb-btn">reset defaults</button>
+    </div>
+    <div id="rules-list" class="rules-list"></div>
+  </section>
+
+  <section class="sb-pane" data-pane="proxy">
+    <div class="sb-info">
+      <div><span>proxy url</span><b id="p-url">—</b></div>
+      <div><span>port</span><b id="p-port">—</b></div>
+      <div><span>session partition</span><b>persist:ghost</b></div>
+    </div>
+    <div class="sb-toolbar">
+      <button id="p-clear" class="sb-btn">clear session data</button>
+      <button id="p-cache" class="sb-btn">clear cache</button>
+    </div>
+  </section>
+</aside>
+
+<div class="sidebar-handle" id="sidebar-handle" title="toggle dev panel (Ctrl+\)">⌥</div>

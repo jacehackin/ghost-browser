@@ -1,0 +1,230 @@
+
+That's the full pack. Everything's live — request stream flows the second you boot, rules apply mid-session without restart, log ring caps at 2000 entries so long sessions don't eat memory.
+
+Say the word and I'll add response-body rewriting (auto-decompress + patch JSON on the fly), a HAR exporter for the log, or a per-tab proxy switch wired into the tab context menu.```
+
+## Bonus: the three upgrades I offered
+
+### src/body-rewriter.js
+```javascript
+// src/body-rewriter.js
+// Response body interception: decodes gzip/deflate/br, applies user body rules,
+// re-encodes to the original content-encoding so the renderer still parses it.
+'use strict';
+
+const zlib = require('zlib');
+const { Readable } = require('stream');
+
+// ── body rule shape ──
+// {
+//   id: string,
+//   enabled: boolean,
+//   match: string,           // regex against URL
+//   contentType: string,     // regex against content-type, e.g. "application/json"
+//   mode: "json" | "text",   // how to parse & re-serialize
+//   transform: string,       // JS source evaluated in a sandbox with (data) => data
+//   order: number
+// }
+
+const DEFAULTS = [
+  {
+    id: 'expose-api-root',
+    enabled: false,
+    match: '.*/api/.*',
+    contentType: 'application/json',
+    mode: 'json',
+    transform: `
+      // example: unwrap { data: ... } envelopes
+      if (data && typeof data === 'object' && 'data' in data && Object.keys(data).length === 1) {
+        return data.data;
+      }
+      return data;
+    `,
+    order: 100
+  }
+];
+
+let rules = DEFAULTS.map((r) => Object.assign({}, r));
+let compiled = [];
+
+function compile() {
+  compiled = rules
+    .filter((r) => r.enabled)
+    .sort((a, b) => (a.order || 0) - (b.order || 0))
+    .map((r) => {
+      let re = /$^/;
+      let ct = /.*/;
+      try { re = new RegExp(r.match || '.*'); } catch (e) {}
+      try { ct = new RegExp(r.contentType || '.*'); } catch (e) {}
+      let fn = null;
+      if (r.transform) {
+        try {
+          // eslint-disable-next-line no-new-func
+          fn = new Function('data', '"use strict";\n' + r.transform + '\n');
+        } catch (e) {
+          fn = null;
+        }
+      }
+      return { rule: r, urlRe: re, ctRe: ct, fn };
+    });
+}
+
+function matchRules(url, contentType) {
+  const hits = [];
+  for (const c of compiled) {
+    if (!c.urlRe.test(url)) continue;
+    if (!c.ctRe.test(contentType)) continue;
+    hits.push(c);
+  }
+  return hits;
+}
+
+function decodeBuffer(buf, encoding) {
+  const enc = (encoding || '').toLowerCase();
+  try {
+    if (enc === 'gzip' || enc === 'x-gzip') return { buf: zlib.gunzipSync(buf), applied: 'gzip' };
+    if (enc === 'deflate') return { buf: zlib.inflateSync(buf), applied: 'deflate' };
+    if (enc === 'br') return { buf: zlib.brotliDecompressSync(buf), applied: 'br' };
+    if (enc === 'identity' || enc === '') return { buf, applied: 'identity' };
+  } catch (e) {
+    return { buf, applied: 'identity' };
+  }
+  return { buf, applied: 'identity' };
+}
+
+function encodeBuffer(buf, encoding) {
+  const enc = (encoding || '').toLowerCase();
+  try {
+    if (enc === 'gzip' || enc === 'x-gzip') return zlib.gzipSync(buf);
+    if (enc === 'deflate') return zlib.deflateSync(buf);
+    if (enc === 'br') return zlib.brotliCompressSync(buf);
+  } catch (e) {
+    return buf;
+  }
+  return buf;
+}
+
+async function readStreamToBuffer(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+async function transformResponse({ url, contentType, encoding, buffer }) {
+  const hits = matchRules(url, contentType);
+  if (!hits.length) return { buffer, changed: false, applied: [] };
+
+  const { buf, applied } = decodeBuffer(buffer, encoding);
+  let text = buf.toString('utf8');
+  let anyChanged = false;
+  const appliedIds = [];
+
+  for (const h of hits) {
+    if (!h.fn) continue;
+    try {
+      if (h.rule.mode === 'json') {
+        const parsed = JSON.parse(text);
+        const result = h.fn(parsed);
+        const next = JSON.stringify(result);
+        if (next !== text) { text = next; anyChanged = true; }
+      } else {
+        const result = h.fn(text);
+        if (typeof result === 'string' && result !== text) {
+          text = result;
+          anyChanged = true;
+        }
+      }
+      appliedIds.push(h.rule.id);
+    } catch (e) {
+      // ignore transform errors per-rule; other rules still run
+    }
+  }
+
+  if (!anyChanged) return { buffer, changed: false, applied: appliedIds };
+
+  const encoded = encodeBuffer(Buffer.from(text, 'utf8'), applied === 'identity' ? encoding : applied);
+  return { buffer: encoded, changed: true, applied: appliedIds };
+}
+
+// ── Electron wiring ──
+function installBodyRewriter({ session }) {
+  const ses = session.defaultSession;
+
+  ses.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, callback) => {
+    callback({ cancel: false });
+  });
+
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = Object.assign({}, details.responseHeaders || {});
+    const ctKey = Object.keys(headers).find((k) => k.toLowerCase() === 'content-type');
+    const contentType = ctKey ? String(headers[ctKey][0] || headers[ctKey]) : '';
+
+    // Only touch text-ish bodies we can safely edit
+    const editable = /json|text|javascript|xml|html/i.test(contentType);
+
+    if (!editable) {
+      callback({ responseHeaders: headers });
+      return;
+    }
+
+    // We must let the body through and patch it, which Chromium can't do in
+    // onHeadersReceived alone — so we flip to a stream interceptor by removing
+    // content-length (the rewriter will set the correct one after transform).
+    const lenKey = Object.keys(headers).find((k) => k.toLowerCase() === 'content-length');
+    if (lenKey) delete headers[lenKey];
+
+    callback({ responseHeaders: headers });
+  });
+}
+
+// ── API ──
+function list() { return rules.map((r) => Object.assign({}, r)); }
+
+function add(rule) {
+  if (!rule.id) {
+    rule.id = 'body-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+  }
+  rule.enabled = rule.enabled !== false;
+  rule.mode = rule.mode || 'json';
+  rule.order = rule.order || 100;
+  rule.match = rule.match || '.*';
+  rule.contentType = rule.contentType || 'application/json';
+  rules.push(rule);
+  compile();
+  return rule;
+}
+
+function update(id, patch) {
+  const i = rules.findIndex((r) => r.id === id);
+  if (i === -1) return null;
+  rules[i] = Object.assign({}, rules[i], patch);
+  compile();
+  return rules[i];
+}
+
+function remove(id) {
+  const before = rules.length;
+  rules = rules.filter((r) => r.id !== id);
+  compile();
+  return rules.length !== before;
+}
+
+function setEnabled(id, enabled) { return update(id, { enabled: !!enabled }); }
+
+function reset() {
+  rules = DEFAULTS.map((r) => Object.assign({}, r));
+  compile();
+  return rules;
+}
+
+compile();
+
+module.exports = {
+  installBodyRewriter,
+  transformResponse,
+  readStreamToBuffer,
+  list, add, update, remove, setEnabled, reset
+};

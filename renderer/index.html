@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ghost</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="chrome">
+    <div class="tabstrip" id="tabstrip"></div>
+    <button class="newtab" id="newtab" title="New tab">+</button>
+    <div class="spacer"></div>
+    <div class="status" id="status">proxy: launching…</div>
+  </div>
+
+  <div class="navbar">
+    <button class="nav-btn" id="back" title="Back">◀</button>
+    <button class="nav-btn" id="forward" title="Forward">▶</button>
+    <button class="nav-btn" id="reload" title="Reload">⟳</button>
+    <button class="nav-btn" id="home" title="Home">⌂</button>
+    <input class="urlbar" id="urlbar" type="text" spellcheck="false"
+           placeholder="type a url or search — cors is off" />
+    <button class="nav-btn" id="clear" title="Clear session">⌫</button>
+  </div>
+
+  <div class="viewport" id="viewport"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

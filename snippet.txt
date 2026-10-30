@@ -1,0 +1,10 @@
+
+Drop it in a folder, `npm install`, `npm start`. Type any URL — cors dead, csp dead, frame restrictions dead. F12 in any tab and `fetch` works cross-origin like it's same-origin.
+
+If you want me to bolt on an intercepting request log, per-tab proxy toggle, or a header-injection rules editor — say the word.## Extending
+
+The base browser ships with the three bypass layers. The extension pack below adds:
+
+- live request log with filter
+- user-defined header rules (per-host match)
+- per-tab proxy toggle

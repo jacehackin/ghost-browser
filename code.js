@@ -1,0 +1,5 @@
+wireBrowserSidebar({
+  ipcMain,
+  session,
+  BrowserWindow
+});
