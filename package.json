@@ -1,11 +1,11 @@
 {
   "name": "ghost-browser",
   "version": "1.0.0",
-  "description": "CORS-free browser with multi-layer bypass",
+  "description": "Fullscreen CORS-free browser with instant search",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "start:debug": "electron . --debug"
+    "dev": "electron . --enable-logging"
   },
   "author": "Mahi",
   "license": "MIT",
